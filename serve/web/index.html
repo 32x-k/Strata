@@ -37,6 +37,14 @@
 <main>
   <!-- ============================ Chat ============================ -->
   <section class="view view--chat" id="view-chat" role="tabpanel" aria-labelledby="tab-btn-chat">
+    <div class="chat-status" id="chat-status" aria-label="Current model resource use">
+      <div class="chat-status__state" id="chat-status-state"><span class="chat-status__dot"></span><span id="chat-status-state-text">Connecting</span></div>
+      <div class="chat-status__item"><span class="chat-status__label">Ring RAM cap</span><strong id="chat-ring-ram">–</strong></div>
+      <div class="chat-status__item"><span class="chat-status__label">System RAM</span><strong id="chat-system-ram">–</strong></div>
+      <div class="chat-status__item"><span class="chat-status__label">VRAM</span><strong id="chat-vram">–</strong></div>
+      <div class="chat-status__item chat-status__speed"><span class="chat-status__label">Decode</span><strong id="chat-decode">–</strong></div>
+      <button type="button" class="st-btn st-btn--secondary chat-status__details" id="chat-status-details">Details</button>
+    </div>
     <div class="chat-scroll" id="chat-scroll">
       <div class="chat" id="chat">
         <div class="chat-empty" id="chat-empty">
@@ -157,7 +165,7 @@
         <span class="card-title">This PC</span>
         <dl class="facts" id="facts-hw"></dl>
       </div>
-      <div class="st-card">
+      <div class="st-card" id="api-card">
         <span class="card-title">Connect your tools</span>
         <p class="muted">Any OpenAI- or Anthropic-compatible client works with these addresses.</p>
         <dl class="facts" id="facts-api"></dl>
@@ -212,7 +220,7 @@
       <input class="st-slider" type="range" id="s-topk" min="1" max="64" step="1">
     </div>
     <div class="st-field">
-      <label class="st-label" for="s-max">Max tokens <output>empty = until done</output></label>
+      <label class="st-label" for="s-max">Max tokens <output id="max-help">empty = until done</output></label>
       <input class="st-input" id="s-max" type="number" min="1" step="1" placeholder="Until done">
     </div>
     <div class="st-field">

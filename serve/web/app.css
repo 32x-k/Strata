@@ -7,6 +7,30 @@ main { flex: 1; min-height: 0; display: flex; }
 .view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .view[hidden] { display: none; }
 .muted { color: var(--st-ink-muted); }
+
+/* ---------------------------------------------------------------- chat status
+   The Ring screen keeps the bounded Hybrid/Ring process resident by default, so keep the host-RAM budget and live
+   hardware readings visible while it is loading.  The same strip is harmless on the normal server and links to the
+   full Monitor tab. */
+.chat-status { flex: none; display: flex; align-items: center; gap: var(--st-s-4); max-width: 860px; width: calc(100% - 2 * var(--st-s-6));
+               margin: 0 auto; padding: var(--st-s-3) 0; border-bottom: 1px solid var(--st-line-soft); color: var(--st-ink-muted);
+               font-size: var(--st-fs-xs); font-variant-numeric: tabular-nums; overflow-x: auto; }
+.chat-status__item, .chat-status__state { display: flex; align-items: baseline; gap: 6px; white-space: nowrap; }
+.chat-status__label { color: var(--st-ink-muted); }
+.chat-status__item strong { color: var(--st-ink); font-weight: var(--st-fw-bold); }
+.chat-status__state { gap: 7px; color: var(--st-ink-soft); font-weight: var(--st-fw-medium); }
+.chat-status__dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--st-ink-muted); }
+.chat-status__state[data-state="reading"] .chat-status__dot { background: var(--st-info); }
+.chat-status__state[data-state="generating"] .chat-status__dot { background: var(--st-accent); animation: blink 1s steps(2) infinite; }
+.chat-status__state[data-state="error"] .chat-status__dot { background: var(--st-danger); }
+.chat-status__details { margin-left: auto; flex: none; height: 28px; padding: 0 10px; }
+.chat-status__speed { min-width: 72px; }
+@media (max-width: 680px) {
+  .chat-status { gap: var(--st-s-3); width: calc(100% - 2 * var(--st-s-4)); }
+  .chat-status__state { min-width: 82px; }
+  .chat-status__details { display: none; }
+}
+
 .small { font-size: var(--st-fs-xs); }
 .card-title { font-weight: var(--st-fw-bold); font-size: var(--st-fs-base); color: var(--st-ink); }
 .st-header { position: relative; z-index: 2; flex: none; }

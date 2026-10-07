@@ -449,6 +449,15 @@ class HipRuntimeBesideExe(unittest.TestCase):
             setup.hip_runtime_beside_exe(Path(d))                   # no BUILD.json (a CUDA or Linux engine)
             self.assertEqual(list(Path(d).iterdir()), [])
 
+    def test_local_cmake_build_uses_sdk_bin(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, eng = Path(d) / "sdk", Path(d) / "build-hip-win"
+            (root / "bin").mkdir(parents=True)
+            eng.mkdir()
+            (eng / "CMakeCache.txt").write_text(
+                "CMAKE_HIP_COMPILER_ROCM_ROOT:UNINITIALIZED=" + root.as_posix() + "\n")
+            self.assertEqual(setup.hip_lib_dirs(eng), [root / "bin"])
+
 
 if __name__ == "__main__":
     unittest.main()

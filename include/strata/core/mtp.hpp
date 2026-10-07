@@ -162,6 +162,7 @@ private:
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
+    bool staged_first_ = false;  ///< draft_first stages the residual in Rin_ without touching the target verifier's R
     float* probs_ = nullptr;
     // device
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *row_ = nullptr, *ident_ = nullptr;
@@ -182,6 +183,9 @@ private:
     uint16_t* x_bf16_ = nullptr;
     float* head_logits_ = nullptr;
     float* dummy_inj_ = nullptr;
+    /// MTP drafts run on their own stream and may overlap verifier commit/main-model work. Never borrow the
+    /// target session's GR scratch (`SessionState::block.gr`), whose kernels can still be in flight.
+    strata::kernels::GrWorkspace gr_;
     int64_t cap_ = 0, attn_scratch_floats_ = 0;
 };
 

@@ -132,6 +132,65 @@ class CarryOver(unittest.TestCase):
             self.assertFalse((Path(d) / "strata-x.json.bak").exists())   # nothing here was replaced
 
 
+class BoundedRing(unittest.TestCase):
+    def test_default_engine_is_the_local_fork_build(self):
+        with tempfile.TemporaryDirectory() as d, unittest.mock.patch.object(setup, "ROOT", Path(d)):
+            eng = Path(d) / "build-hip-win"
+            eng.mkdir()
+            (eng / setup.EXE).write_bytes(b"fork ring engine")
+            self.assertEqual(setup.find_ring_engine(gpu={"arch": "gfx1201"}), eng)
+
+    def test_direct_args_keep_static_cache_and_drop_server_only_modes(self):
+        args = ["--pack", "C:/pack", "--expert-cache", "auto", "--expert-profile", "profile.bin",
+                "--expert-cache-per-layer", "--resident-experts", "--spec", "4", "--spec-min-p", "0.5",
+                "--mtp", "rt", "--mtp-window", "16384", "--mtp-max-t", "4", "--prefill", "auto",
+                "--max-context", "32768"]
+        got = setup.bounded_ring_args(args, 20)
+        self.assertEqual(got, ["--pack", "C:/pack", "--expert-cache", "auto", "--expert-profile", "profile.bin",
+                               "--expert-cache-per-layer", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "rt",
+                               "--mtp-window", "16384", "--mtp-max-t", "4", "--prefill", "auto", "--max-context",
+                               "32768", "--expert-ram-gb", "20"])
+
+    def test_direct_args_can_share_the_total_budget_with_resident_ram(self):
+        got = setup.bounded_ring_args(["--expert-cache", "auto", "--expert-profile", "profile.bin"], 14, 6)
+        self.assertEqual(got, ["--expert-cache", "auto", "--expert-profile", "profile.bin",
+                               "--expert-ram-gb", "14", "--resident-budget-gib", "6"])
+
+    def test_direct_script_sets_hip_device_and_never_starts_server(self):
+        with tempfile.TemporaryDirectory() as d, unittest.mock.patch.object(setup, "ROOT", Path(d)), \
+                unittest.mock.patch.object(setup, "WIN", True):
+            script = setup.write_bounded_ring_script("Q2_0", "C:/strata.exe",
+                                                    ["--pack", "C:/pack", "--expert-ram-gb", "20"], 1, 20,
+                                                    ["C:/hip/bin"])
+            text = script.read_text(encoding="utf-8")
+            self.assertIn('set "HIP_VISIBLE_DEVICES=1"', text)
+            self.assertIn('set "ROCM_BIN=C:/hip/bin"', text)
+            self.assertIn('"--expert-ram-gb" "20"', text)
+            self.assertIn("%*", text)
+            self.assertNotIn("server.py", text)
+
+    def test_ring_chat_script_writes_local_config_and_browser_launcher(self):
+        with tempfile.TemporaryDirectory() as d, unittest.mock.patch.object(setup, "ROOT", Path(d)), \
+                unittest.mock.patch.object(setup, "WIN", True):
+            script = setup.write_bounded_ring_chat_script(
+                "Q2_0", "C:/strata.exe", ["--pack", "C:/pack", "--max-context", "32768",
+                                             "--expert-ram-gb", "20"], 0, 20, ["C:/hip/bin"],
+                {"RING_TEST": "1", "STRATA_HIPBLASLT_TUNING": "C:/table.txt"})
+            text = script.read_text(encoding="utf-8")
+            cfg = json.loads((Path(d) / "strata-q2_0-ring-chat.json").read_text(encoding="utf-8"))
+            self.assertEqual(cfg["ring_ram_gb"], 20)
+            self.assertEqual(cfg["tokenizer"], str(Path("C:/pack") / "tokenizer"))
+            self.assertEqual(cfg["env"]["STRATA_HIPBLASLT_TUNING"], "C:/table.txt")
+            self.assertIn("ring_chat.py", text)
+            self.assertIn('set "ROCM_BIN=C:/hip/bin"', text)
+            self.assertIn("--open", text)
+            self.assertIn('set "HIP_VISIBLE_DEVICES=0"', text)
+            self.assertIn("stay loaded between messages", text)
+            self.assertIn("--reload-each-turn", text)
+            self.assertIn("RING_TEST", text)
+            self.assertIn('set "STRATA_HIPBLASLT_TUNING=C:/table.txt"', text)
+
+
 class NoBrowser(unittest.TestCase):
     """#609 (#631): --no-browser keeps the chat page from opening: "open_browser": false in the run config, no --open
     on the start's server command or in run-<model>.bat/.sh.  Without the flag nothing changes."""

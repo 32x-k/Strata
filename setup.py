@@ -28,8 +28,10 @@ answers, no questions), --setup (install another model / change settings instead
 --host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --build (compile instead of the ready-made
-engine), --check (only check this PC), --resident-budget-gib N (UD-Q4_K_XL's or UD-IQ4_XS's experts in RAM),
---kv-streaming on|off|auto.
+engine), --check (only check this PC), --resident-budget-gib N (UD-Q4_K_XL's or UD-IQ4_XS's experts in RAM; with
+--expert-ram-gb, the Resident share of the same bounded Q2_0 budget), --expert-ram-gb N (Windows AMD direct runner;
+writes run-<model>-ring.bat and a local run-<model>-ring-chat.bat,
+not the server config), --ring-engine DIR (the fork-built Ring engine folder; default build-hip-win), --kv-streaming on|off|auto.
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
 than it recommends - a longer context, more GPUs, a bigger RAM budget, a size it thinks will not fit - is kept, with
@@ -115,6 +117,7 @@ CUDA12_WHEELS = ["nvidia-cublas-cu12==12.9.1.4", "nvidia-cuda-runtime-cu12==12.9
 # toolkit the CUDA 12 zip is built with (cuBLAS 12.9.1.4, runtime 12.9.79).  Not tested on such an old driver here.
 CUDA12_MIN_DRIVER = 528 if WIN else 525
 ENGINE12_DIR = "engine-cuda12"
+RING_ENGINE_DIR = "build-hip-win"      # the fork build used by --expert-ram-gb when no --ring-engine is given
 MIN_ENGINE = (0, 1, 39)                # v0.1.39: the #577 file-tier regression fixed, the OpenAI Responses API (#451, Codex), a reply stuck on one token ended (#606), the head before the arena (#620), effort_position (#458), --vram-reserve hot resize opt-in (#533), PR batch; v0.1.38: prompts faster (one gather per expert group #372, the first chunk's PLE rows beside layer 0 #374, DeltaNet three heads per thread #413), --kv q4_0 prompts on tensor cores (#452), Q5_0 experts on the GPU (#473), IQ4_XS on AVX-2 (#415), unbuffered expert loading on Windows (#357 #362), --peer-device (#531), a 6 GB card starts (#496), PR batch; v0.1.37: a silent engine is restarted (#481), Windows AMD counts the desktop's VRAM (#380 #377 #497), a steadier PCIe probe (#485), fixes #496 #495 #498 #505 #493; v0.1.36: a cancelled prompt logged as read so far (#471), the draft-head hint (#474), UPDATE.bat (#475), --expert-profile-save (#477); v0.1.35: Windows AMD uses its bundled HIP runtime (#468 #461), the low-RAM resident mode on Windows 32 GB (#467), fixes #460 #459 #446 #447 #457 #448 #444; v0.1.34: AMD on Windows (a ready-made HIP engine), an MCP server for AI assistants (tools/strata_mcp.py), a shorter README; v0.1.33: a portable image encoder again (#411 #412), setup recommends instead of forcing (#406 #403 #364 #384), fixes #352 #365 #369 #371 #375 #393 #408 #414; v0.1.32: split prompts faster (#340), AMD router +12%, Unsloth Q4 in setup, faster Q4 prompts, #326/#327/#342/#344 fixes, PR batch; v0.1.31: Unsloth UD-Q4_K_XL (experimental), GGUF-in-place low-RAM mode, Windows GGUF load 2x, server race + tokenizer fixes, AMD intrinsics; v0.1.30: short prompts faster (streaming from 1024 tokens), resident low-RAM variant, multi-GPU session carve, RDNA4; v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 REQUIREMENTS = ROOT / "requirements.txt"   # the same packages and their dependencies, pinned (#214)
@@ -1619,12 +1622,35 @@ def hip_devices(probe: Path | None = None, text: str | None = None) -> list[dict
 
 
 def hip_lib_dirs(eng: Path) -> list[Path]:
-    """Where the ready-made Windows HIP engine's ROCm DLLs are (its BUILD.json "lib_dirs", relative to engine/)."""
+    """Where a Windows HIP engine's ROCm DLLs are.
+
+    Packaged engines record relative ``lib_dirs`` in BUILD.json.  The fork build used by the bounded Ring is often an
+    unpackaged CMake tree, so recover its SDK root from CMakeCache.txt; otherwise a freshly generated Ring launcher
+    starts without hipBLASLt on PATH and Windows reports that libhipblaslt.dll is missing.
+    """
     try:
         rel = json.loads((eng / "BUILD.json").read_text()).get("lib_dirs") or []
     except (OSError, ValueError):
         rel = []
-    return [eng / d for d in rel if (eng / d).is_dir()]
+    dirs = [eng / d for d in rel if (eng / d).is_dir()]
+    if dirs:
+        return dirs
+
+    # Local HIP builds do not have BUILD.json.  CMake keeps the exact ROCm SDK root that linked the executable here;
+    # use its bin folder for both the setup probe and the generated direct/chat launchers.
+    try:
+        cache = (eng / "CMakeCache.txt").read_text(errors="replace").splitlines()
+    except OSError:
+        cache = []
+    keys = ("CMAKE_HIP_COMPILER_ROCM_ROOT:", "ROCM_PATH:")
+    for line in cache:
+        if not line.startswith(keys):
+            continue
+        root = line.split("=", 1)[-1].strip()
+        candidate = Path(root) / "bin"
+        if candidate.is_dir():
+            return [candidate]
+    return []
 
 
 # #468 #461: the HIP runtime the ready-made engine was built with, next to strata.exe.  Windows looks for an imported
@@ -1748,6 +1774,75 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
     ok(f"ready-made AMD engine {meta.get('version', '')} for {', '.join(meta.get('archs', []))} "
        f"(ROCm {meta.get('rocm', '?')})")
     return eng
+
+
+def find_ring_engine(path=None, gpu=None) -> Path:
+    """Find the fork-built Windows HIP binary for the direct bounded-ring runner.
+
+    Unlike the normal setup path this never downloads the public release engine. The default is the local fork build;
+    ``--ring-engine`` may point at a packaged fork build instead.
+    """
+    if path:
+        candidates = [Path(path).expanduser()]
+    else:
+        candidates = [ROOT / RING_ENGINE_DIR, ROOT / "engine-ring"]
+    reasons = []
+    for eng in candidates:
+        if eng.is_file() and eng.name.lower() == EXE.lower():
+            eng = eng.parent
+        exe = eng / EXE
+        if not exe.is_file():
+            reasons.append(f"{eng} に {EXE} がありません")
+            continue
+        info = eng / "BUILD.json"
+        if info.is_file():
+            try:
+                meta = json.loads(info.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                reasons.append(f"{info} を読めません: {e}")
+                continue
+            if meta.get("backend") not in (None, "hip"):
+                reasons.append(f"{eng} はHIPエンジンではありません")
+                continue
+            archs = meta.get("archs") or []
+            if gpu is not None and archs and gpu.get("arch") not in archs:
+                reasons.append(f"{eng} は {gpu.get('arch')} 向けにビルドされていません")
+                continue
+        # A local CMake build has no packaged BUILD.json and Windows prefers a same-named System32 HIP runtime over
+        # the SDK directory on PATH. Put the runtime that built this executable beside it, just like the packaged
+        # engine, or a machine-wide amdhip64_7.dll can silently mix ROCm versions.
+        hip_runtime_beside_exe(eng)
+        return eng
+    tried = ", ".join(str(x) for x in candidates)
+    detail = "; ".join(reasons) if reasons else "Ring対応エンジンが見つかりません"
+    fail("Ring用のforkビルド済みWindows HIPエンジンを使えません", detail +
+         f"。確認先: {tried}。別の場所なら --ring-engine DIR を指定してください")
+    raise AssertionError("fail() did not stop setup")
+
+
+def ring_probe_devices(eng: Path) -> list[dict]:
+    """Read the HIP ordinals and real VRAM from the Ring build before setup sizes the model."""
+    probe = eng / "strata-device.exe"
+    if not probe.is_file():
+        fail(f"Ring engine is missing {probe.name}",
+             f"build it with: cmake --build \"{eng}\" --target strata-device; or pass --ring-engine DIR to a packaged fork build")
+    env = dict(os.environ)
+    dirs = [str(d) for d in hip_lib_dirs(eng)]
+    if dirs:
+        env["PATH"] = os.pathsep.join(dirs + ([env["PATH"]] if env.get("PATH") else []))
+    try:
+        result = subprocess.run([str(probe), "--list-devices"], capture_output=True, text=True, timeout=120,
+                                cwd=str(eng), env=env)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        fail(f"Ring engine GPU probe failed: {e}", f"run {probe} --list-devices and check the HIP runtime")
+    if result.returncode != 0:
+        fail(f"Ring engine GPU probe failed (exit {result.returncode})",
+             (result.stdout or result.stderr or "run strata-device.exe --list-devices for its error")[-2000:])
+    devices = hip_devices(probe, text=result.stdout)
+    if not devices:
+        fail("Ring engine GPU probe returned no HIP devices",
+             f"run {probe} --list-devices and check the AMD driver")
+    return devices
 
 
 def rocm_version(root):
@@ -3466,6 +3561,115 @@ def write_run_script(model, cfg_path, port, open_browser=True):
     return script
 
 
+# The normal setup config remains the general server config. The bounded Ring gets a separate direct runner and a
+# local browser launcher: the latter adds the persistent --serve loop only after the Ring's fixed-profile/fixed-slot
+# constraints have been applied. The Ring accepts the normal static profile/cache pair and fixed-slot MTP/speculation;
+# adaptive/remote cache modes still have to disappear from the bounded commands.
+_RING_VALUE_FLAGS = frozenset({
+    "--expert-ram-gb", "--expert-profile-save", "--expert-profile-save-every",
+    "--expert-cache-device1", "--expert-cache-device2", "--expert-cache-device3",
+    "--expert-cache-remote-placement", "--peer-device", "--peer-reserve-mib", "--peer-slots",
+    "--peer-adapt-swaps", "--peer-prefill-rows", "--batch", "--slots", "--batch-groups", "--layer-split",
+    "--split-device", "--pcie-frac", "--pcie-mode", "--resident-budget-gib", "--shared-expert-arena",
+})
+_RING_FLAG_FLAGS = frozenset({
+    "--expert-cache-cpu-order", "--expert-cache-remote", "--remote-expert-opt",
+    "--peer", "--spec-split", "--mmap-experts", "--resident-experts", "--resident-cpu-experts",
+    "--vram-elastic", "--serve", "--no-capture",
+})
+
+
+def bounded_ring_args(args, ram_gb: int, resident_budget_gib: float | None = None) -> list[str]:
+    """Turn setup's normal engine args into the supported direct Q2_0 bounded-ring command.
+
+    ``resident_budget_gib`` is optional because the normal server's resident budget flags must not leak into a
+    plain Ring command. When supplied for Q2_0, it is the Resident share of the same bounded expert-RAM budget.
+    """
+    out = []
+    i = 0
+    while i < len(args):
+        flag = str(args[i])
+        if flag in _RING_VALUE_FLAGS:
+            i += 2
+            continue
+        if flag in _RING_FLAG_FLAGS:
+            i += 1
+            continue
+        out.append(str(args[i]))
+        i += 1
+    out += ["--expert-ram-gb", str(int(ram_gb))]
+    if resident_budget_gib is not None:
+        out += ["--resident-budget-gib", f"{float(resident_budget_gib):g}"]
+    return out
+
+
+def write_bounded_ring_script(model, exe, args, gpu, ram_gb, lib_dirs=(), env=None):
+    """Write a direct Windows runner; its ``%*`` supplies --tokens and other per-run arguments."""
+    if not WIN:
+        raise RuntimeError("the bounded expert-RAM runner is currently Windows-only")
+    script = ROOT / f"run-{model.lower()}-ring.bat"
+    command = " ".join([f'\"{exe}\"'] + [f'\"{x}\"' for x in args] + ["%*"])
+    setup_env = ([f'set "ROCM_BIN={lib_dirs[0]}"',
+                  f'set "PATH={";".join(str(d) for d in lib_dirs)};%PATH%"'] if lib_dirs else [])
+    setup_env += [f'set "{k}={v}"' for k, v in (env or {}).items()
+                  if k not in ("STRATA_RESIDENT_PIN", "STRATA_RESIDENT_HEADROOM_GIB")]
+    text = ("@echo off\n"
+            f"title Strata {model} - bounded expert RAM ({ram_gb} GiB)\n"
+            f"cd /d \"{ROOT}\"\n"
+            f"set \"HIP_VISIBLE_DEVICES={gpu}\"\n"
+            + "\n".join(setup_env) + ("\n" if setup_env else "") +
+            "echo Direct bounded expert-RAM mode (not the server; pass --tokens \"...\")\n"
+            "echo Example: run-" + model.lower() + "-ring.bat --tokens \"11,353,2688,264\" --max-new 16\n"
+            + command + "\nif errorlevel 1 pause\n")
+    script.write_text(text, encoding="utf-8")
+    return script
+
+
+def write_bounded_ring_chat_script(model, exe, args, gpu, ram_gb, lib_dirs=(), env=None, port=8080):
+    """Write a local browser-chat launcher for the persistent bounded Ring.
+
+    This is intentionally not the normal external-compatible server config: ``serve/ring_chat.py`` starts the local
+    browser page and adds the Ring-compatible persistent ``--serve`` loop.  The generated JSON keeps the large paths
+    out of the batch command line and lets the browser launcher share the validated direct-runner arguments.
+    ``--reload-each-turn`` remains available as an explicit one-shot diagnostic mode.
+    """
+    if not WIN:
+        raise RuntimeError("the bounded expert-RAM browser chat is currently Windows-only")
+    tag = model.lower()
+    cfg_path = ROOT / f"strata-{tag}-ring-chat.json"
+    pack = ""
+    try:
+        pack = args[args.index("--pack") + 1]
+    except (ValueError, IndexError):
+        pass
+    cfg = {
+        "exe": str(exe), "args": [str(x) for x in args], "cwd": str(ROOT),
+        "tokenizer": str(Path(pack) / "tokenizer") if pack else "",
+        "model_name": f"{tag}-ring", "log": str(ROOT / f"strata-{tag}-ring-chat.log"),
+        "backend": "hip", "gpu": int(gpu), "ring_ram_gb": int(ram_gb),
+        "lib_dirs": [str(x) for x in lib_dirs], "env": dict(env or {}), "port": int(port),
+    }
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    script = ROOT / f"run-{tag}-ring-chat.bat"
+    setup_env = ([f'set "ROCM_BIN={lib_dirs[0]}"',
+                  f'set "PATH={";".join(str(d) for d in lib_dirs)};%PATH%"'] if lib_dirs else [])
+    setup_env += [f'set "{k}={v}"' for k, v in (env or {}).items()
+                  if k not in ("STRATA_RESIDENT_PIN", "STRATA_RESIDENT_HEADROOM_GIB")]
+    python = sys.executable
+    text = ("@echo off\n"
+            f"title Strata {model} - Ring chat\n"
+            f"cd /d \"{ROOT}\"\n"
+            f"set \"HIP_VISIBLE_DEVICES={gpu}\"\n"
+            + "\n".join(setup_env) + ("\n" if setup_env else "") +
+            "echo Local persistent Ring chat screen (not the OpenAI/Anthropic server)\n"
+            "echo The model and bounded Ring/Hybrid allocation stay loaded between messages.\n"
+            "echo Add --reload-each-turn for the diagnostic one-shot mode.\n"
+            f'"{python}" "{ROOT / "serve" / "ring_chat.py"}" --config "{cfg_path}" --port {int(port)} --open %*\n'
+            "if errorlevel 1 pause\n")
+    script.write_text(text, encoding="utf-8")
+    return script
+
+
 # ------------------------------------------------------------------------------------------------ the rope config
 def derived_factor(ctx: int, trained: int = 262144) -> float:
     """The automatic extension factor: the FINAL context over the trained one, at least 1.
@@ -3605,8 +3809,13 @@ def main() -> int:
                          "this mode the experts the GPU does not hold are copied into RAM once when they fit (resident), "
                          "else read through the OS file cache (mmap); resident / mmap force one of the two")
     ap.add_argument("--resident-budget-gib", type=float, metavar="N",
-                    help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, 40 on 64 GB; "
-                         "more is kept as you choose, with a note)")
+                    help="normal resident mode: GiB of experts kept in RAM (default: the RAM less 24 GB; with "
+                         "--expert-ram-gb, the Resident share of the same bounded Q2_0 budget)")
+    ap.add_argument("--expert-ram-gb", type=int, metavar="N",
+                    help="experimental: write a Windows AMD Q2_0 direct-runner with a bounded pinned expert-RAM ring "
+                         "of N GiB; this is separate from the server config")
+    ap.add_argument("--ring-engine", metavar="DIR",
+                    help="--expert-ram-gb: fork-built Ring engine folder (default: build-hip-win)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
                          "default: 700); the expert cache takes that much less")
@@ -3626,6 +3835,8 @@ def main() -> int:
         return sycl_setup(sys.argv[1:])
     if a.resident_budget_gib is not None and not a.resident_budget_gib > 0:
         ap.error("--resident-budget-gib takes a number of GiB above 0, e.g. --resident-budget-gib 32")
+    if a.expert_ram_gb is not None and a.expert_ram_gb < 1:
+        ap.error("--expert-ram-gb takes a whole number of GiB above 0, e.g. --expert-ram-gb 20")
     if a.vision_tokens is not None and a.vision_tokens < 1:
         ap.error("--vision-tokens takes a number of image tokens, 1 or more, e.g. --vision-tokens 768")
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
@@ -3647,7 +3858,8 @@ def main() -> int:
     have = installed_configs()
     if a.update:                                       # #475: UPDATE.bat / update.sh - never starts the model
         return update_install(have, a)
-    explicit = a.setup or a.model or a.family or a.check or a.no_start
+    explicit = a.setup or a.model or a.family or a.check or a.no_start or a.expert_ram_gb is not None or \
+               a.ring_engine is not None
     adopted = None                                     # #629: the earlier install this copy is set up like
     if not have and not explicit:                      # a new copy of Strata (an update unzipped elsewhere): set it
         prev = previous_config(elsewhere, load_settings())   # up like the last one, from the files already here
@@ -3714,8 +3926,15 @@ def main() -> int:
 
     # ---- 1. the PC
     step(1, "checking your PC")
+    ring_eng = None
+    ring_devices = None
+    if a.expert_ram_gb is not None and WIN and a.backend != "cuda":
+        ring_eng = find_ring_engine(a.ring_engine)
+        ring_devices = ring_probe_devices(ring_eng)
+        ok("Ring GPU probe: " + ", ".join(f"GPU {g['index']} {g['name']} ({g['vram_gb']:.1f} GB)"
+                                           for g in ring_devices))
     found = gpus()
-    amd = amd_gpus()
+    amd = ring_devices if ring_devices is not None else amd_gpus()
     amd_ok = [g for g in amd if amd_problem(g) is None]
     # older NVIDIA GPUs (Pascal / Volta): the experimental CUDA 12 engine, when chosen (docs/OLDER_GPUS.md)
     OLD_GPUS = OLD_GPUS or old_gpus_opt_in(found, named_gpus(a.gpu, a.gpus), a.cuda,
@@ -3794,6 +4013,11 @@ def main() -> int:
                  "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again" +
                  ("" if cuda_tk == 12 else f" (or --cuda 12: the experimental CUDA 12 engine runs with driver "
                                            f"{CUDA12_MIN_DRIVER} or newer, docs/OLDER_GPUS.md)"))
+    if a.expert_ram_gb is not None and (not WIN or not hip):
+        fail("--expert-ram-gb currently supports the Windows AMD direct runner only",
+             "use it with --backend hip on Windows; the normal server config is not changed")
+    if a.expert_ram_gb is not None and multi:
+        fail("--expert-ram-gb supports one AMD GPU only", "use --gpu N, not --gpus")
     if gpu["vram_gb"] < 11:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()
@@ -3890,6 +4114,16 @@ def main() -> int:
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
+    if a.expert_ram_gb is not None and model != "Q2_0":
+        fail("--expert-ram-gb currently supports Q2_0's canonical experts.bin only",
+             "choose --model Q2_0, or leave --expert-ram-gb off")
+    if a.expert_ram_gb is not None and a.resident_budget_gib is not None:
+        if a.resident_budget_gib >= a.expert_ram_gb:
+            fail("--resident-budget-gib must be smaller than --expert-ram-gb",
+                 "the Resident share and the Ring share use one bounded expert-RAM budget")
+        else:
+            ok(f"hybrid expert budget: {a.resident_budget_gib:g} GiB Resident + the remainder of the "
+               f"{a.expert_ram_gb} GiB Ring budget")
     budget, q4_split = None, False
     if MODELS[model].get("budget"):
         # Unsloth's UD-Q4_K_XL: a RAM budget of experts, the rest from the GGUF on the SSD - not the low-RAM mode (no
@@ -3922,7 +4156,7 @@ def main() -> int:
             ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
         if a.low_ram not in ("auto", "off"):
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
-    elif a.resident_budget_gib is not None:
+    elif a.resident_budget_gib is not None and a.expert_ram_gb is None:
         warn(f"--resident-budget-gib is for UD-Q4_K_XL and UD-IQ4_XS: {model} keeps all of its experts in RAM or in "
              "the low-RAM mode")
     low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
@@ -4097,13 +4331,18 @@ def main() -> int:
     llama = get_llama_cpp()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
     if hip and WIN:                                    # AMD on Windows: the ready-made HIP engine (no compiler)
-        eng = None if a.build else get_prebuilt_hip(a.prebuilt, gpu)
-        if eng is None:
-            fail("no ready-made AMD engine for this Strata version" + (" (--build)" if a.build else ""),
-                 "compiling it on Windows: tools\\hip\\build_windows.bat makes strata-windows-x64-hip.zip, then run "
-                 "START-HERE.bat --backend hip --prebuilt <its dist folder> (docs/AMD_HIP.md)")
-        gpu = hip_card(eng, gpu, amd)
-        a.gpu = gpu["index"] if gpu["count"] > 1 else a.gpu
+        if a.expert_ram_gb is not None:
+            # The public release is built from the base tree and may not contain the Ring source. Do not silently use it.
+            eng = ring_eng or find_ring_engine(a.ring_engine, gpu)
+            ok(f"Ring engine: {eng / EXE} (fork build; HIP GPU ordinal {gpu['index']})")
+        else:
+            eng = None if a.build else get_prebuilt_hip(a.prebuilt, gpu)
+            if eng is None:
+                fail("no ready-made AMD engine for this Strata version" + (" (--build)" if a.build else ""),
+                     "compiling it on Windows: tools\\hip\\build_windows.bat makes strata-windows-x64-hip.zip, then run "
+                     "START-HERE.bat --backend hip --prebuilt <its dist folder> (docs/AMD_HIP.md)")
+            gpu = hip_card(eng, gpu, amd)
+            a.gpu = gpu["index"] if gpu["count"] > 1 else a.gpu
     else:
         eng = None if a.build or hip else get_prebuilt(a.prebuilt, gpu, vision, **({"toolkit": 12} if cuda_tk == 12
                                                                                     else {}))
@@ -4116,7 +4355,14 @@ def main() -> int:
             vision = prebuilt_vision(json.loads((eng / "BUILD.json").read_text()), gpu, vision)
     if eng is None:
         eng = build_engine_hip(gpu, llama, vision) if hip else build_engine(gpu, vision, a.yes, llama, toolkit=cuda_tk)
-    meta = json.loads((eng / "BUILD.json").read_text())
+    info = eng / "BUILD.json"
+    if info.exists():
+        meta = json.loads(info.read_text())
+    elif a.expert_ram_gb is not None:
+        # build-hip-win is the checked-out fork build and is intentionally not a packaged setup engine.
+        meta = {"version": ".".join(map(str, MIN_ENGINE)), "backend": "hip", "source": "local"}
+    else:
+        fail(f"the engine metadata is missing: {info}")
     if hip and WIN:                                    # the ready-made engine's rocm/bin, first on the engine's PATH
         lib_dirs = [str(d) for d in hip_lib_dirs(eng)]
     else:
@@ -4192,6 +4438,9 @@ def main() -> int:
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
              "--experts-bin"], env=env)
     ok(f"model prepared: {pack}")
+    if a.expert_ram_gb is not None and (not (pack / "experts.bin").is_file() or not (pack / "index.txt").is_file()):
+        fail("--expert-ram-gb needs the canonical Q2_0 pack's experts.bin",
+             f"{pack} is not an indexed Q2_0 pack; use the normal server config or prepare the Q2_0 AVX-512 pack first")
     mtp = (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
     rt = mtp / "rt"
     corrupt = (rt / "experts.bin").exists() and mtp_corrupt(mtp, env)
@@ -4383,6 +4632,15 @@ def main() -> int:
         cfg["args"] = recommend_pool_workers(cfg["args"])
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
+    ring_script = ring_chat_script = None
+    if a.expert_ram_gb is not None:
+        ring_budget = a.resident_budget_gib if a.resident_budget_gib is not None else None
+        ring_args = bounded_ring_args(cfg["args"], a.expert_ram_gb, ring_budget)
+        ring_script = write_bounded_ring_script(tag, cfg["exe"], ring_args, gpu["index"], a.expert_ram_gb,
+                                                cfg.get("lib_dirs") or [], cfg.get("env") or {})
+        ring_chat_script = write_bounded_ring_chat_script(tag, cfg["exe"], ring_args, gpu["index"],
+                                                          a.expert_ram_gb, cfg.get("lib_dirs") or [],
+                                                          cfg.get("env") or {}, port)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
     if cal is None and not hip and not a.no_start and not a.yes and ask(
             "Tune Strata for this PC now? It measures a few engine settings (about 5-10 minutes; the PC is busy "
@@ -4391,6 +4649,16 @@ def main() -> int:
     else:
         tuned = None                                   # not asked for: nothing to repeat below
     ok(f"start script: {script.name}")
+    if ring_script is not None:
+        ok(f"direct bounded-RAM script: {ring_script.name} (--expert-ram-gb {a.expert_ram_gb}; pass --tokens on the command line)")
+        ok(f"local Ring chat screen: {ring_chat_script.name} (browser UI; persistent Ring/Hybrid process)")
+        say()
+        say("Ring setup is ready; the normal server was not started.")
+        say(f"  Direct test: {ring_script.name} --tokens \"11,353,2688,264\" --max-new 16")
+        say(f"  Chat screen: {ring_chat_script.name}")
+        say("  The chat screen keeps the Ring/Hybrid process loaded between turns; pass --reload-each-turn for one-shot diagnostics.")
+        say("  The regular strata-*.json remains the normal server config; it is not changed to use Ring.")
+        return 0
 
     say()
     say("All set.")

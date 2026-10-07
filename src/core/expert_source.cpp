@@ -23,6 +23,7 @@
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <iterator>
 #include <sstream>
 #include <limits>
 #include <map>
@@ -55,6 +56,11 @@
 #endif
 
 namespace strata::core {
+
+// The decode callback for layer `l` runs after the stream has reached that layer's ring and before `post[l]` is
+// enqueued.  At the start of layer `l + 1`, `post[l]` and `pre[l + 1]` are already ordered on the same stream, so
+// layer `l` is safe to release.  The final layer is released by the driver after the session call returns.
+static constexpr int64_t LAG_DECODE = 1;
 
 namespace detail {
 
@@ -1847,6 +1853,417 @@ bool FileExpertSource::pcie_layer(int64_t layer) const {
     return device_alias(layer, 0) != nullptr;
 }
 
+// ================================ THE BOUNDED RING ================================
+
+RingExpertSource::~RingExpertSource() { close(); }
+
+bool RingExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, uint64_t ram_bytes,
+                            std::string& err) {
+    close();
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if (n_layers <= 0 || n_expert <= 0 || lay.n_layers != n_layers || lay.n_expert != n_expert) {
+        err = "RingExpertSource: the expert layout was loaded for a different geometry";
+        return false;
+    }
+    if (lay.native) {
+        err = "RingExpertSource: --expert-ram-gb supports Q2_0 experts.bin only; native GGUF experts are not supported";
+        return false;
+    }
+    if (lay.max_blob == 0 || lay.total == 0) {
+        err = "RingExpertSource: the layout has no blob size";
+        return false;
+    }
+    // A bounded slot can safely hold the canonical Q2_0 blob only when the pack is the flat experts.bin layout.
+    // Native GGUF assembly has variable per-layer slices and remains deliberately outside this port.
+    const std::string path = pack_dir + "/experts.bin";
+    {
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (!f) {
+            err = "RingExpertSource: --expert-ram-gb needs experts.bin; a native GGUF pack without one is not supported by the ring yet";
+            return false;
+        }
+        const std::streampos end = f.tellg();
+        if (end < 0 || (uint64_t) end != lay.total) {
+            char buf[400];
+            std::snprintf(buf, sizeof buf,
+                          "RingExpertSource: %s is %llu B but the loaded geometry needs %llu B - this is not the "
+                          "pack the geometry came from", path.c_str(),
+                          (unsigned long long) (end < 0 ? 0 : (uint64_t) end), (unsigned long long) lay.total);
+            err = buf;
+            return false;
+        }
+    }
+    slot_bytes_ = (int64_t) lay.max_blob;
+    blobs_ = n_layers * n_expert;
+    slots_ = (int64_t) (ram_bytes / (uint64_t) slot_bytes_);
+    if (slots_ > blobs_) slots_ = blobs_;
+    if (slots_ < 1) {
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "RingExpertSource: %.2f GB is smaller than one expert blob (%lld B)",
+                      (double) ram_bytes / (1024.0 * 1024.0 * 1024.0), (long long) slot_bytes_);
+        err = buf;
+        return false;
+    }
+    verifier_slots_ = std::min<int64_t>(verifier_reserve_requested_, slots_);
+    if (verifier_slots_ >= slots_) {
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "RingExpertSource: verifier reservation needs fewer than %lld of the %lld Ring slots",
+                      (long long) slots_, (long long) slots_);
+        err = buf;
+        verifier_slots_ = normal_slots_ = 0;
+        return false;
+    }
+    normal_slots_ = slots_ - verifier_slots_;
+
+    std::vector<uint64_t> bounds{0, (uint64_t) slots_ * (uint64_t) slot_bytes_};
+    PinnedArena* a = new PinnedArena((uint64_t) slots_ * (uint64_t) slot_bytes_, bounds);
+    if (!a->valid()) {
+        delete a;
+        err = "RingExpertSource: the pinned ring could not be reserved";
+        return false;
+    }
+    arena_ = a;
+    base_ = a->data();
+    if (a->registered_bytes == (uint64_t) slots_ * (uint64_t) slot_bytes_) {
+        void* d = nullptr;
+        if (cudaHostGetDevicePointer(&d, (void*) base_, 0) == cudaSuccess) dev_ = (const uint8_t*) d;
+        else (void) cudaGetLastError();
+    }
+    file_ = std::fopen(path.c_str(), "rb");
+    if (file_ == nullptr) {
+        close();
+        err = "RingExpertSource: cannot open " + path + " for reading";
+        return false;
+    }
+    slot_.assign((size_t) slots_, Slot{});
+    index_.assign((size_t) blobs_, -1);
+    lru_.clear();
+    for (int64_t s = 0; s < slots_; ++s) {
+        lru_.push_back(s);
+        slot_[(size_t) s].lru = std::prev(lru_.end());
+    }
+    layer_slots_.clear();
+    verifier_layer_slots_.clear();
+    cur_layer_ = -1;
+    verifier_cur_layer_ = -1;
+    verifier_age_ = 0;
+    verifier_active_ = false;
+    held_layer_ = -1;
+    n_expert_ = n_expert;
+    reads_ = hits_ = misses_ = evictions_ = thrash_ = 0;
+    path_ = path;
+    return true;
+}
+
+void RingExpertSource::close() {
+    std::lock_guard<std::mutex> lk(mu_);
+    // Destruction is also the failure-path cleanup.  Do not free a slot arena while a late stream operation can
+    // still read it; the normal path has already synchronized, so this is normally a no-op.
+    if (base_ != nullptr) (void) cudaDeviceSynchronize();
+    if (file_ != nullptr) { std::fclose(file_); file_ = nullptr; }
+    if (arena_ != nullptr) { delete (PinnedArena*) arena_; arena_ = nullptr; }
+    base_ = nullptr;
+    dev_ = nullptr;
+    slot_.clear();
+    index_.clear();
+    lru_.clear();
+    layer_slots_.clear();
+    verifier_layer_slots_.clear();
+    cur_layer_ = -1;
+    verifier_cur_layer_ = -1;
+    verifier_age_ = 0;
+    verifier_active_ = false;
+    held_layer_ = -1;
+    normal_slots_ = 0;
+    verifier_slots_ = 0;
+    slots_ = 0;
+    slot_bytes_ = 0;
+    blobs_ = 0;
+    n_expert_ = 0;
+    path_.clear();
+    resident_ = nullptr;
+}
+
+bool RingExpertSource::read_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+    if (file_ == nullptr || dst == nullptr) return false;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const size_t bytes = (size_t) lay.blob_bytes(layer);
+    if (STRATA_FSEEK64(file_, (int64_t) lay.blob_offset(layer, expert)) != 0) return false;
+    return std::fread(dst, 1, bytes, file_) == bytes;
+}
+
+bool RingExpertSource::gate_done(const void* gate) {
+    if (gate == nullptr) return true;
+    return cudaEventQuery((cudaEvent_t) gate) == cudaSuccess;
+}
+
+int64_t RingExpertSource::reusable_slot() {
+    for (auto it = lru_.begin(); it != lru_.end(); ++it) {
+        const int64_t at = *it;
+        if (at >= normal_slots_) continue;   // the fixed verifier tail is never an ordinary LRU victim
+        const Slot& s = slot_[(size_t) at];
+        if (!s.held && gate_done(s.gate)) return at;
+    }
+    return -1;
+}
+
+int64_t RingExpertSource::reusable_verifier_slot() {
+    int64_t best = -1;
+    uint64_t age = UINT64_MAX;
+    for (int64_t at = normal_slots_; at < slots_; ++at) {
+        const Slot& s = slot_[(size_t) at];
+        if (s.verifier_held || !gate_done(s.gate)) continue;
+        if (best < 0 || s.verifier_age < age) {
+            best = at;
+            age = s.verifier_age;
+        }
+    }
+    return best;
+}
+
+int64_t RingExpertSource::acquire_unlocked(int64_t layer, int64_t expert) {
+    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_ ||
+        layer >= blobs_ / n_expert_) return -1;
+    const int64_t key = layer * n_expert_ + expert;
+    if (key < 0 || key >= blobs_) return -1;
+    if (layer != cur_layer_) {
+        // The caller must release the preceding layer before starting another one.  Do not discard its hold list:
+        // losing it would make the slots permanently non-reusable and would be less safe than failing the source.
+        if (!layer_slots_.empty()) return -1;
+        cur_layer_ = layer;
+        held_layer_ = layer;
+        layer_slots_.clear();
+    }
+
+    const int64_t hit = index_[(size_t) key];
+    if (hit >= 0 && hit < normal_slots_ && slot_[(size_t) hit].layer == layer &&
+        slot_[(size_t) hit].expert == expert) {
+        ++hits_;
+        Slot& s = slot_[(size_t) hit];
+        s.held = true;
+        lru_.splice(lru_.end(), lru_, s.lru);
+        layer_slots_.push_back(hit);
+        return hit;
+    }
+
+    ++misses_;
+    int64_t s = reusable_slot();
+    if (s < 0) {
+        ++thrash_;
+        // A completed stream event may become visible only after a device sync.  Never select a held slot after
+        // that sync: a ring smaller than one layer's working set must fail rather than overwrite a live blob.
+        if (cudaDeviceSynchronize() != cudaSuccess) return -1;
+        s = reusable_slot();
+        if (s < 0) return -1;
+    }
+    Slot& v = slot_[(size_t) s];
+    if (v.layer >= 0) {
+        const int64_t old = v.layer * n_expert_ + v.expert;
+        if (old >= 0 && old < blobs_ && index_[(size_t) old] == s) index_[(size_t) old] = -1;
+        ++evictions_;
+    }
+    if (!read_blob(layer, expert, base_ + (uint64_t) s * (uint64_t) slot_bytes_)) return -1;
+    ++reads_;
+    v.layer = layer;
+    v.expert = expert;
+    v.held = true;
+    v.gate = nullptr;
+    index_[(size_t) key] = s;
+    lru_.splice(lru_.end(), lru_, v.lru);
+    layer_slots_.push_back(s);
+    return s;
+}
+
+int64_t RingExpertSource::acquire_verifier_unlocked(int64_t layer, int64_t expert) {
+    if (base_ == nullptr || verifier_slots_ <= 0 || layer < 0 || expert < 0 || expert >= n_expert_ ||
+        layer >= blobs_ / n_expert_) return -1;
+    const int64_t key = layer * n_expert_ + expert;
+    if (key < 0 || key >= blobs_) return -1;
+    if (layer != verifier_cur_layer_) {
+        if (!verifier_layer_slots_.empty()) return -1;
+        verifier_cur_layer_ = layer;
+        verifier_layer_slots_.clear();
+    }
+
+    const int64_t hit = index_[(size_t) key];
+    if (hit >= normal_slots_ && hit < slots_ && slot_[(size_t) hit].layer == layer &&
+        slot_[(size_t) hit].expert == expert) {
+        ++hits_;
+        Slot& s = slot_[(size_t) hit];
+        if (!s.verifier_held) {
+            s.verifier_held = true;
+            verifier_layer_slots_.push_back(hit);
+        }
+        s.verifier_age = ++verifier_age_;
+        return hit;
+    }
+
+    ++misses_;
+    const int64_t s = reusable_verifier_slot();
+    if (s < 0) {
+        ++thrash_;
+        return -1;
+    }
+    Slot& v = slot_[(size_t) s];
+    if (v.layer >= 0) {
+        const int64_t old = v.layer * n_expert_ + v.expert;
+        if (old >= 0 && old < blobs_ && index_[(size_t) old] == s) index_[(size_t) old] = -1;
+        ++evictions_;
+    }
+    if (!read_blob(layer, expert, base_ + (uint64_t) s * (uint64_t) slot_bytes_)) return -1;
+    ++reads_;
+    v.layer = layer;
+    v.expert = expert;
+    v.held = false;
+    v.verifier_held = true;
+    v.verifier_age = ++verifier_age_;
+    v.gate = nullptr;
+    index_[(size_t) key] = s;
+    verifier_layer_slots_.push_back(s);
+    return s;
+}
+
+int64_t RingExpertSource::acquire(int64_t layer, int64_t expert) {
+    std::lock_guard<std::mutex> lk(mu_);
+    return acquire_unlocked(layer, expert);
+}
+
+bool RingExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+    if (dst == nullptr) return false;
+    if (resident_ != nullptr && resident_->has_resident(layer, expert))
+        return resident_->copy_blob(layer, expert, dst);
+    std::lock_guard<std::mutex> lk(mu_);
+    const int64_t s = verifier_active_ ? acquire_verifier_unlocked(layer, expert) : acquire_unlocked(layer, expert);
+    if (s < 0) return false;
+    std::memcpy(dst, base_ + (uint64_t) s * (uint64_t) slot_bytes_,
+                (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer));
+    return true;
+}
+
+void RingExpertSource::release_layer(int64_t layer, void* after_event) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (layer != cur_layer_) return;
+    if (after_event != nullptr && cudaEventSynchronize((cudaEvent_t) after_event) != cudaSuccess) return;
+    for (const int64_t s : layer_slots_) {
+        Slot& sl = slot_[(size_t) s];
+        if (sl.held && sl.layer == layer) { sl.held = false; sl.gate = nullptr; }
+    }
+    layer_slots_.clear();
+    held_layer_ = -1;
+}
+
+bool RingExpertSource::begin_window(int64_t layer, const int32_t* ids, int64_t n) {
+    if (n < 0 || (ids == nullptr && n > 0)) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (verifier_slots_ <= 0) {
+        if (layer != cur_layer_ && !layer_slots_.empty()) return false;
+        for (int64_t i = 0; i < n; ++i)
+            if (ids[i] >= 0 && ids[i] < n_expert_ &&
+                (resident_ == nullptr || !resident_->has_resident(layer, ids[i])) &&
+                acquire_unlocked(layer, ids[i]) < 0) {
+                // The non-tail compatibility path still has to be transactional: a partial reservation would make
+                // the next layer look permanently busy after the caller observes begin_window(false).
+                for (const int64_t s : layer_slots_) {
+                    Slot& sl = slot_[(size_t) s];
+                    if (sl.held && sl.layer == layer) { sl.held = false; sl.gate = nullptr; }
+                }
+                layer_slots_.clear();
+                held_layer_ = -1;
+                return false;
+            }
+        return true;
+    }
+    if (verifier_cur_layer_ != layer) {
+        if (!verifier_layer_slots_.empty()) return false;
+        verifier_cur_layer_ = layer;
+        verifier_layer_slots_.clear();
+    }
+    verifier_active_ = true;
+    for (int64_t i = 0; i < n; ++i)
+        if (ids[i] >= 0 && ids[i] < n_expert_ &&
+            (resident_ == nullptr || !resident_->has_resident(layer, ids[i])) &&
+            acquire_verifier_unlocked(layer, ids[i]) < 0) {
+            for (const int64_t s : verifier_layer_slots_) {
+                Slot& sl = slot_[(size_t) s];
+                if (sl.layer == layer) {
+                    const int64_t key = sl.layer * n_expert_ + sl.expert;
+                    if (key >= 0 && key < blobs_ && index_[(size_t) key] == s) index_[(size_t) key] = -1;
+                    sl.layer = sl.expert = -1;
+                    sl.verifier_held = false;
+                    sl.verifier_age = 0;
+                }
+            }
+            verifier_layer_slots_.clear();
+            verifier_cur_layer_ = -1;
+            verifier_active_ = false;
+            return false;
+        }
+    return true;
+}
+
+void RingExpertSource::release_window(int64_t layer) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (verifier_slots_ <= 0) {
+        if (layer == cur_layer_) {
+            for (const int64_t s : layer_slots_) {
+                Slot& sl = slot_[(size_t) s];
+                if (sl.held && sl.layer == layer) { sl.held = false; sl.gate = nullptr; }
+            }
+            layer_slots_.clear();
+            held_layer_ = -1;
+        }
+        return;
+    }
+    if (layer != verifier_cur_layer_) return;
+    for (const int64_t s : verifier_layer_slots_) {
+        Slot& sl = slot_[(size_t) s];
+        if (sl.layer == layer) {
+            const int64_t key = sl.layer * n_expert_ + sl.expert;
+            if (key >= 0 && key < blobs_ && index_[(size_t) key] == s) index_[(size_t) key] = -1;
+            sl.layer = sl.expert = -1;
+            sl.verifier_held = false;
+            sl.verifier_age = 0;
+            sl.gate = nullptr;
+        }
+    }
+    verifier_layer_slots_.clear();
+    verifier_cur_layer_ = -1;
+    verifier_active_ = false;
+}
+
+const uint8_t* RingExpertSource::blob(int64_t layer, int64_t expert) {
+    if (resident_ != nullptr && resident_->has_resident(layer, expert))
+        return resident_->blob(layer, expert);
+    std::lock_guard<std::mutex> lk(mu_);
+    const int64_t s = verifier_active_ ? acquire_verifier_unlocked(layer, expert) : acquire_unlocked(layer, expert);
+    return s < 0 ? nullptr : base_ + (uint64_t) s * (uint64_t) slot_bytes_;
+}
+
+bool RingExpertSource::pinned(int64_t layer, int64_t expert) const {
+    if (resident_ != nullptr && resident_->has_resident(layer, expert))
+        return resident_->pinned(layer, expert);
+    return dev_ != nullptr;
+}
+
+const uint8_t* RingExpertSource::device_alias(int64_t layer, int64_t expert) const {
+    (void) layer;
+    (void) expert;
+    return nullptr;
+}
+
+bool RingExpertSource::transient(int64_t layer, int64_t expert) const {
+    return resident_ == nullptr || !resident_->has_resident(layer, expert);
+}
+
+void RingExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
+    if (ids == nullptr) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    for (int64_t i = 0; i < k; ++i)
+        if (ids[i] >= 0 && ids[i] < n_expert_ &&
+            (resident_ == nullptr || !resident_->has_resident(layer, ids[i])))
+            (void) acquire_unlocked(layer, ids[i]);
+}
+
 // ================================ THE ADAPTER ================================
 
 void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
@@ -1874,12 +2291,6 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     }
     if (k > (int64_t) d.jobs.size()) d.jobs.resize((size_t) k);
 
-    d.src->begin_layer(d.layers, ids, k);
-
-    // Clause 1: rebuilt from `x_f` on EVERY call.  `x_f` is mapped pinned memory whose address never changes,
-    // so anything cached against it would be layer 0's activation reused 48 times.
-    act_quant_q8_1(x_f, H, d.act);
-
     // ---- R4.2c: THE POOL'S HALF OF THE SPLIT.  **IT DOES NOT DECIDE ANYTHING - `Launch` ALREADY DID.**
     //
     // The decision has to be made on THIS layer's ids, and `Launch` is the only callback that runs before the
@@ -1890,6 +2301,44 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     // `njobs` indexes the JOB ARRAY and `i` indexes the OUTPUT - they are the same only when nothing is a hit.
     const bool graph_hits = d.host_res != nullptr;
     const bool use_hits = graph_hits || (d.hits_ready() && d.decided);
+    auto cache_hit = [&](int64_t i) {
+        const int64_t e = ids[i];
+        return use_hits && e >= 0 && e < d.n_expert &&
+               (graph_hits ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0
+                           : d.is_hit[(size_t) i] != 0);
+    };
+
+    // Bound a transient source's previous layer to the actual CUDA stream timeline.  `cache_stream` is also the
+    // stream used by the hit path in cache-enabled builds; the bounded-ring path installs it even without a cache.
+    if (d.src != nullptr && d.cache_stream != nullptr && d.release_ev != nullptr && d.layers >= LAG_DECODE) {
+        const cudaError_t e = cudaEventRecord((cudaEvent_t) d.release_ev, (cudaStream_t) d.cache_stream);
+        if (e != cudaSuccess) {
+            d.failed = true;
+            d.fail = "could not record the expert-ring release event";
+            d.fail_layer = d.layers;
+            return;
+        }
+        d.src->release_layer(d.layers - LAG_DECODE, d.release_ev);
+    }
+
+    // A bounded source must not read a second host blob for an expert the VRAM tier already owns.  This is
+    // especially important for Ring: `begin_layer(ids)` would otherwise load every GPU hit into the host ring
+    // before the pool discards the pointer below.  Dynamic admissions are already marked in `is_hit` by Launch.
+    const int32_t* source_ids = ids;
+    int64_t source_k = k;
+    if (d.src != nullptr && d.src->transient() && use_hits) {
+        d.source_ids.clear();
+        for (int64_t i = 0; i < k; ++i)
+            if (!cache_hit(i)) d.source_ids.push_back(ids[i]);
+        source_ids = d.source_ids.data();
+        source_k = (int64_t) d.source_ids.size();
+    }
+    d.src->begin_layer(d.layers, source_ids, source_k);
+
+    // Clause 1: rebuilt from `x_f` on EVERY call.  `x_f` is mapped pinned memory whose address never changes,
+    // so anything cached against it would be layer 0's activation reused 48 times.
+    act_quant_q8_1(x_f, H, d.act);
+
     int64_t njobs = 0;
 
     if (d.remote_count > 0) {
@@ -1917,21 +2366,10 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
             d.fail_expert = e;
             return;
         }
-        const uint8_t* b = d.src->blob(d.layers, e);
-        if (b == nullptr) {
-            // The one failure the loop cannot see.  Leaving `out` at its previous contents would feed the NEXT
-            // layer a stale expert vector, which `moe_combine` would weight and add - the token would still be
-            // finite and would still be wrong, 48 layers deep.
-            d.failed = true;
-            d.fail = "the expert source could not produce a blob";
-            d.fail_layer = d.layers;
-            d.fail_expert = e;
-            ++d.missing;
-            return;
-        }
-        // A hit's row was zeroed by `Launch` and belongs to the GPU; the pool must not touch it.
-        if (use_hits && (graph_hits ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0
-                                    : d.is_hit[(size_t) i] != 0)) {
+
+        // A hit's row was zeroed by `Launch` and belongs to the GPU; the pool must not touch it or ask a bounded
+        // source for a host blob that cannot contribute to the result.
+        if (cache_hit(i)) {
             if (graph_hits) ++d.cache_hits;
             // The GPU owns this row and `hit_out` is zeroed, so the CPU's contribution is zero - but
             // `y_miss` is a REUSED pinned buffer, so the row must be written, not merely skipped.
@@ -1945,6 +2383,19 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         if (remote_owns) {
             std::memset(out + (size_t) i * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
             continue;
+        }
+
+        const uint8_t* b = d.src->blob(d.layers, e);
+        if (b == nullptr) {
+            // The one failure the loop cannot see.  Leaving `out` at its previous contents would feed the NEXT
+            // layer a stale expert vector, which `moe_combine` would weight and add - the token would still be
+            // finite and would still be wrong, 48 layers deep.
+            d.failed = true;
+            d.fail = "the expert source could not produce a blob";
+            d.fail_layer = d.layers;
+            d.fail_expert = e;
+            ++d.missing;
+            return;
         }
 
         // `njobs` indexes the JOB ARRAY and `i` indexes the OUTPUT - they are the same only when nothing is a
@@ -2008,8 +2459,25 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     };
     const auto c0 = std::chrono::steady_clock::now();
     pt("begin");
-    d.src->begin_layer(d.layers, ids, n_tok * k);
-    pt("begun");
+    // A static GPU residency table is already known before the verifier window starts. Do not make the bounded
+    // source acquire GPU-owned rows: the multi-token path can otherwise fill the Ring with copies that the CPU
+    // immediately discards. Resident-RAM rows are filtered by the source itself.
+    d.source_ids.clear();
+    for (int64_t i = 0; i < n_tok * k; ++i) {
+        const int32_t e = ids[i];
+        const bool gpu = d.host_res != nullptr && e >= 0 && e < d.n_expert &&
+                         d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0;
+        if (!gpu) d.source_ids.push_back(e);
+    }
+    const int32_t* source_ids = d.source_ids.data();
+    const int64_t source_n = (int64_t) d.source_ids.size();
+    if (!d.src->begin_window(d.layers, source_ids, source_n)) {
+        d.failed = true;
+        d.fail = "the verifier Ring reservation could not hold this window's CPU experts";
+        d.fail_layer = d.layers;
+        return;
+    }
+    pt("begun", source_n);
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
@@ -2112,6 +2580,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         std::string perr;
         if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out)) {
             std::fprintf(stderr, "strata: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
+            d.src->release_window(d.layers);
             d.failed = true;
             d.fail = "the peer GPU's experts could not be launched";
             d.fail_layer = d.layers;
@@ -2122,6 +2591,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r) {
             if (!d.remote[r]->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error)) {
+                d.src->release_window(d.layers);
                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
             }
             for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
@@ -2166,6 +2636,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const int64_t e = ids[i];
             float* row = out + (size_t) i * H;
             if (e < 0 || e >= d.n_expert) {
+                // begin_window() has already acquired the fixed verifier partition.  Every post-reservation failure
+                // must roll it back, including malformed routed ids, or the next window can inherit an orphaned hold.
+                d.src->release_window(d.layers);
                 d.failed = true;
                 d.fail = "a routed expert id is out of range";
                 d.fail_layer = d.layers;
@@ -2188,6 +2661,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (jo < 0) {
                 const uint8_t* b = d.src->blob(d.layers, e);
                 if (b == nullptr) {
+                    // Do not leave the verifier tail held if a source read fails after begin_window().
+                    d.src->release_window(d.layers);
                     d.failed = true;
                     d.fail = "the expert source could not produce a blob";
                     d.fail_layer = d.layers;
@@ -2217,6 +2692,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
             if (!d.remote[r]->finish(out, remote_error)) {
+                d.src->release_window(d.layers);
                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
             }
     }
@@ -2224,12 +2700,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         std::string perr;
         if (!d.peer->finish(out, perr)) {
             std::fprintf(stderr, "strata: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
+            d.src->release_window(d.layers);
             d.failed = true;
             d.fail = "the peer GPU's experts failed";
             d.fail_layer = d.layers;
             return;
         }
     }
+    // The verifier's CPU pool has finished synchronously for this layer. No PCIe path is allowed in the bounded
+    // Ring phase, so its host blobs are no longer referenced; release the fixed window partition before the next
+    // layer. The later graph phase will replace this with a stream fence.
+    d.src->release_window(d.layers);
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -2269,6 +2750,13 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
             if (e < 0 || e >= d.n_expert) continue;   // out of range: the pool refuses it, with a message
             int32_t slot = d.cache->slot_of(d.layers, e);
             if (slot == kNotResident) {
+                // A static profile is deliberately closed after startup.  In particular, do not turn a free
+                // tail slot into an asynchronous Ring fill: the residency table and the host-source lifetime are
+                // both fixed for this mode.
+                if (d.cache_static) {
+                    ++d.cache_refused;
+                    continue;
+                }
                 const int32_t cand = d.cache->admit(d.layers, e);
                 if (cand == kNotResident) {
                     ++d.cache_refused;

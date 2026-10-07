@@ -308,6 +308,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     release_gpu_fn().store(&release_live_verifiers);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
+    if (std::getenv("STRATA_VERIFY_NO_GRAPH") != nullptr) no_graph_ = true;
+    if (no_graph_) std::fprintf(stderr, "strata verify: CUDA Graphs off (direct MTP/Ring correctness path)\n");
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     wt_ = &wt;
     g_ = &g;
@@ -901,10 +903,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 16, grp);
         gr_read_group(1, true, inj_, inj2_);
         static const bool sh_stream_env = [] {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+            // The side-stream fork is opt-in on AMD; STRATA_SH_STREAM=1 enables the overlap path.
+            return env_on("STRATA_SH_STREAM");
+#else
             const char* e = std::getenv("STRATA_SH_STREAM");
             return !e || e[0] != '0';
+#endif
         }();
-        const bool sh_fork = sh_stream_env && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
+        // The direct verifier path is a correctness diagnostic, not the overlap benchmark. Keep its shared-expert
+        // work on the verifier stream so it has the same deterministic ordering as STRATA_SH_STREAM=0; captured
+        // graphs retain the measured fork/join overlap by default.
+        const bool sh_fork = !no_graph_ && sh_stream_env && !prof_on_ && sh_cs_ != nullptr &&
+                             ev_fork_ != nullptr && ev_join_ != nullptr;
         cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
         if (sh_fork) {
             cudaEventRecord(ev_fork_, cs);
@@ -1200,6 +1211,7 @@ std::string Verifier::profile_report() {
 }
 
 bool Verifier::capture(int T, std::string& err) {
+    if (no_graph_) return true;
     if (exec_[T] != nullptr) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
@@ -1262,8 +1274,7 @@ bool Verifier::capture(int T, std::string& err) {
     return true;
 }
 
-bool Verifier::capture_commit(std::string& err) {
-    if (commit_exec_ != nullptr) return true;
+bool Verifier::record_commit(std::string& err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -1273,10 +1284,6 @@ bool Verifier::capture_commit(std::string& err) {
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-        err = "verify: begin commit capture failed";
-        return false;
-    }
     bool ok = true;
     try {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
@@ -1313,6 +1320,17 @@ bool Verifier::capture_commit(std::string& err) {
         err = std::string("verify commit: ") + e.what();
         ok = false;
     }
+    return ok;
+}
+
+bool Verifier::capture_commit(std::string& err) {
+    if (no_graph_) return true;
+    if (commit_exec_ != nullptr) return true;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "verify: begin commit capture failed";
+        return false;
+    }
+    const bool ok = record_commit(err);
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
@@ -1418,9 +1436,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    cudaError_t le = cudaSuccess;
+    if (no_graph_) {
+        if (!record_window(T, cs_, err)) return false;
+    } else {
+        le = cudaGraphLaunch(exec_[T], cs_);
+        if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    }
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
-    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
@@ -1704,8 +1727,13 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
-    if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+    cudaError_t le = cudaSuccess;
+    if (no_graph_) {
+        if (!record_commit(err)) return false;
+    } else {
+        le = cudaGraphLaunch(commit_exec_, cs_);
+        if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+    }
     // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
     // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
     // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).

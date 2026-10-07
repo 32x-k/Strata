@@ -102,11 +102,19 @@ async function loadHealth() {
     health = await (await fetch("health")).json();
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
-    $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
+    $("max-help").textContent = health.ring ? "empty = 1024 for Ring" : "empty = until done";
+    $("s-max").placeholder = health.ring ? "1024 for Ring" : "Until done";
+    const persistentRing = health.ring_mode === "persistent serve";
+    $("chat-empty-sub").textContent = health.ring
+      ? `${health.model} runs in the bounded Ring on this PC. ${persistentRing ? "The model stays loaded between messages." : "Each message starts one direct run."}`
+      : `${health.model} runs on this PC. Nothing leaves it.`;
+    $("api-card").hidden = !!health.ring;
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
 }
+
+$("chat-status-details").onclick = () => showTab("monitor");
 
 // ------------------------------------------------------------------ Monitor
 const METRICS = [
@@ -150,6 +158,24 @@ function setMetric(key, value, unit, sub) {
   $(`ms-${key}`).textContent = sub || "";
 }
 
+function renderChatStatus(live, hw, eng, last) {
+  const state = live.state || "idle";
+  const label = state === "reading" ? (eng.ring_mode ? "Loading Ring" : "Reading prompt")
+              : state === "generating" ? "Generating"
+              : state === "unloaded" ? "Ready"
+              : eng.ring_mode ? "Ring ready" : "Idle";
+  const stateEl = $("chat-status-state");
+  stateEl.dataset.state = state === "unloaded" ? "idle" : state;
+  $("chat-status-state-text").textContent = label;
+  const ring = eng.ring_ram_gb != null ? `${fmt(eng.ring_ram_gb, 1)} GiB cap`
+             : eng.arena_mib ? `${gb(eng.arena_mib * 1048576)} GB` : "–";
+  $("chat-ring-ram").textContent = ring;
+  $("chat-system-ram").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` : "–";
+  $("chat-vram").textContent = hw.gpu_mem_total ? `${gb(hw.gpu_mem_used)} / ${gb(hw.gpu_mem_total, 0)} GB` : "–";
+  const speed = state === "generating" ? live.tok_s : last && last.decode_tok_s;
+  $("chat-decode").textContent = speed == null ? "–" : `${fmt(speed, 1)} t/s`;
+}
+
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
 async function poll() {
@@ -180,6 +206,7 @@ function setPill(state, text) {
 function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || [])[0];
+  renderChatStatus(live, hw, eng, last);
   // the header pill
   if (live.state === "reading") {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
@@ -374,6 +401,8 @@ function renderAbout(eng, hw, st) {
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
+    ["Ring host RAM", eng.ring_ram_gb != null ? `${fmt(eng.ring_ram_gb, 1)} GiB bounded cap` : null],
+    ["Execution", eng.ring_mode ? (eng.ring_mode === "persistent serve" ? "Persistent Hybrid/Ring (stays loaded)" : "Direct one-shot Ring (reloads per turn)") : null],
     ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
     ["Images", eng.images ? "on" : "off"],
     ["Experimental speed projection", projectionText(eng.cvec)],
@@ -784,10 +813,11 @@ async function send() {
   }
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
+  else if (health.ring) body.max_tokens = 1024;  // keep the local Ring chat's default bounded; the persistent process owns the model
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
 
-  let firstAt = null, thinkStart = null, usage = null, frame = 0;
+  let firstAt = null, thinkStart = null, usage = null, timings = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
   try {
     const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
@@ -815,6 +845,7 @@ async function send() {
         try { j = JSON.parse(data); } catch (e) { continue; }
         if (j.error) throw new Error(j.error.message || "the engine reported an error");
         if (j.usage) usage = j.usage;
+        if (j.timings) timings = j.timings;       // the engine clock; unlike a buffered Ring ID burst, this is real decode time
         if (j.strata_mcp) onTool(m, j.strata_mcp);
         const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
         const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
@@ -839,9 +870,12 @@ async function send() {
   }
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   const n = usage ? usage.completion_tokens : null;
-  if (n && firstAt) {
-    const secs = (performance.now() - firstAt) / 1000;
-    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
+  const measured = timings && Number.isFinite(Number(timings.predicted_per_second)) && Number(timings.predicted_per_second) > 0
+    ? Number(timings.predicted_per_second) : null;
+  if (n && (firstAt || measured != null)) {
+    const wallSecs = firstAt ? (performance.now() - firstAt) / 1000 : 0;
+    const speed = measured != null ? measured : wallSecs > 0.25 ? n / wallSecs : null;
+    m.meta = `${fmt(n)} tokens${speed != null ? ` · ${fmt(speed, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
              (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
   } else if (m.stopped) {
     m.meta = "Stopped";

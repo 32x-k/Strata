@@ -179,6 +179,57 @@ GPU nor the RAM budget holds (only pages - the experts computed are the same; `S
 is what runs [Unsloth's UD-Q4_K_XL](UNSLOTH_Q4.md) (72 GiB of experts) on a 64 GB PC: 7-8.5 tokens/s at N = 40 on an
 RTX 5070, against ~3 tokens/s before these changes.
 
+**Bounded expert-RAM ring (engine 0.1.39, experimental):** `--expert-ram-gb N` replaces the full resident arena with a
+bounded LRU ring of pinned slots. It accepts only the canonical Q2_0 `experts.bin`; native GGUF expert assembly,
+PCIe aliases, batching, serving, layer splits and multi-GPU runs are intentionally refused. A static GPU expert cache is
+supported when `--expert-cache` and `--expert-profile` are supplied together: setup fills that fixed VRAM tier once,
+GPU hits bypass Ring reads, and routed misses remain on the CPU. Runtime cache admission and eviction are not supported.
+With that static cache and the fixed verifier-tail reservation, speculative decoding and MTP are supported in the
+single-GPU path; `--no-verify-graph` (or `STRATA_VERIFY_NO_GRAPH=1`) runs the same verifier directly without CUDA
+Graphs for correctness checks, keeps shared-expert work on the verifier stream for deterministic ordering, and is slower.
+Use it for normal single-GPU decode and prefill; `--mmap-experts` is mutually exclusive. On the tested 32 GB Windows AMD PC, 17 GiB is the current setting; 14-16 GiB leaves more
+RAM and Windows commit headroom. The value is a capacity rather than a safety minimum: the routed working set of one
+layer still has to fit. `--resident-budget-gib R` may be combined with the Ring on Windows AMD: R GiB is the
+maximum Resident complement and the Ring receives the remainder of the same `--expert-ram-gb N` budget. For example,
+`--expert-ram-gb 14 --resident-budget-gib 6` never requests a separate 6 GiB arena in addition to the Ring. The
+Resident allocation is attempted before the remainder Ring is committed; if its physical-RAM or Windows-commit safety
+check fails, the Resident copy is released and the full bounded Ring is used instead.
+
+The ring disables the captured token graph and records a CUDA/HIP event before releasing each layer's slots. This
+keeps CPU reads, host-to-device copies and GPU consumers ordered. A small ring is useful for correctness/eviction tests,
+not as a performance setting; a profile-filled GPU cache is a separate static experiment and still uses the normal
+per-layer release path. On the Radeon AI PRO R9700 (31.9 GiB, gfx1201), the same 17 GiB Ring run measured 6.77
+whole-answer decode tokens/s without the GPU tier and 18.87 tokens/s over four decode tokens with the static tier,
+seven pool workers and `int8` KV. The latter run reported 3,786/3,840 routed cache hits (98.59%). The runs used
+16 and 4 output tokens respectively, so these decode rates are a smoke measurement, not a directly comparable or
+general GPU benchmark.
+
+On HIP, the shared-expert verifier side stream is opt-in: unset `STRATA_SH_STREAM` (or `=0`) keeps that work on the verifier stream; `=1` enables the fork. On the Windows R9700, a 511-token prompt followed by 128 greedy Q2_0 Ring tokens with MTP spec4 measured 50.01 tok/s with the fork off and 37.37 tok/s with it on. Both runs accepted 90 of 107 drafts in 39 rounds. With a 12-token prompt and 512 generated tokens, two runs per setting averaged 32.03 tok/s off and 26.82 tok/s on; each setting reproduced its own token stream, while the two settings differed from token 143. These are single-card measurements, not a bitwise-equivalence claim. HIP now defaults to off; set `STRATA_SH_STREAM=1` to opt back in.
+
+The R9700's hipBLASLt 1.5.0 run explicitly used `tools/hip/gfx1201-hipblaslt-100500.txt`: the engine loaded all 32 table rows, and a 511-token Q2_0 Ring prefill reported 782 launches and zero fallbacks. Two 511-token prompt runs averaged 2.292 s with the table and 2.271 s without; this is no measurable gain for this workload (the runs ranged 2.195–2.389 s with the table and 2.245–2.297 s without). With the table and `int8` KV, two prompt runs averaged 2.292 s without WMMA and 2.240 s with `STRATA_HIP_WMMA=1` (about 2.3% faster in this small A/B). A separate synthetic WMMA test at context 2048, 128 queries measured 5.240 to 0.411 ms per chunk (12.74x); the model-level prompt measurements are much smaller. WMMA remains opt-in and these runs were kept separate from token-output equality checks because its attention sum order can change output bits.
+
+On Windows AMD, `setup.py --expert-ram-gb N` writes a separate `run-q2_0-ring.bat` and uses the fork-built engine in
+`build-hip-win` by default. Use `--ring-engine DIR` for another fork build; setup does not fall back to the public
+release engine because it may not contain the Ring implementation. It also writes `run-q2_0-ring-chat.bat`, a local
+browser chat that reuses the pack tokenizer and chat template and keeps the bounded Hybrid/Ring `--serve` process
+loaded between turns. The normal external OpenAI/Anthropic server remains separate and is not configured for Ring;
+`--reload-each-turn` on the browser launcher opts into the old one-shot diagnostic mode. The chat page keeps a compact
+status strip visible on the Chat tab: bounded Ring RAM, current system RAM, VRAM and decode speed; `Details` opens the
+full Monitor.
+
+**Resident RAM comparison on Windows AMD:** the fork already contains the upstream `FileExpertSource` resident
+complement. Without `--expert-ram-gb`, `--resident-experts` copies the experts outside the fixed GPU profile into
+stable anonymous RAM; `STRATA_RESIDENT_PIN=0` keeps this copy pageable, which is the safer AMD setting. On the same
+Radeon AI PRO R9700 and 11-token prompt, 1,024 greedy tokens measured 25.12 tokens/s with `--no-token-graph` and
+54.46 tokens/s with the captured token graph. The resident copy was 5.63 GiB without the prompt loan and 8.90 GiB
+with the graph path's loaned cache slots. A trace-reordered workload profile raised the same graph run to 59.27
+tokens/s and the GPU cache hit rate from 91.80% to 99.52%. These are one-prompt measurements, not a general model
+benchmark; build the profile from several representative prompts before using it. The graph is safe here because the
+resident complement's pointers remain valid, unlike a transient Ring slot. `STRATA_RESIDENT_PIN=0` does not prevent
+Windows from paging the copy, and the startup headroom check is not a hard reservation against other processes; use the
+Ring when a strict RAM allocation bound is required. This is an alternative resident mode, not a change to the bounded
+Ring contract: `--expert-ram-gb` still keeps the token graph off.
+
 **How much came from where:** with `--stats` the engine prints the tiers of the decode (`expert tiers`: blobs from the
 RAM copy, blobs and MB from the files, the time spent reading them; `routing prefetch`: how many of the file reads had
 been warmed). The server log has the same per request (`expert tiers: GPU ... hits ...; RAM ... blobs, files ...

@@ -78,9 +78,13 @@ public:
     /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
+    /// Select the verifier execution backend before init().  The no-graph path is intentionally opt-in and is used
+    /// for MTP/Ring correctness checks; it keeps the same host doorbell protocol but enqueues kernels directly.
+    void set_graph(bool on) { no_graph_ = !on; }
 
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
-    /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
+    /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use
+    /// unless set_graph(false) selected the direct correctness path.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
@@ -125,7 +129,8 @@ public:
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
-    /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
+    /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.  The commit is
+    /// captured once by default and enqueued directly when set_graph(false) was selected.
     bool commit(int n_keep, std::string& err);
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
@@ -268,6 +273,8 @@ private:
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;
     bool copy_used_ = false;
+    bool no_graph_ = false;       ///< opt-in correctness path: enqueue each verifier operation without CUDA Graph capture
+    bool record_commit(std::string& err);
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,

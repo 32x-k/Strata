@@ -25,10 +25,13 @@
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <condition_variable>
+#include <cstdio>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -138,6 +141,24 @@ public:
     virtual void begin_layer(int64_t layer, const int32_t* ids, int64_t k) { (void) layer; (void) ids; (void) k; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+
+    /// A bounded source reuses host slots.  The caller promises that every consumer of `layer` has finished after
+    /// `after_event` (a CUDA event recorded on the consuming stream); persistent sources treat this as a no-op.
+    virtual void release_layer(int64_t layer, void* after_event) { (void) layer; (void) after_event; }
+    /// A multi-token verifier window. The default preserves the persistent-source contract; bounded sources may
+    /// reserve a separate fixed slot range for the window and return false when its reservation is too small.
+    virtual bool begin_window(int64_t layer, const int32_t* ids, int64_t n) {
+        begin_layer(layer, ids, n);
+        return true;
+    }
+    /// Releases a verifier window after its CPU expert work has returned. Graph-aware callers will replace this with
+    /// a stream fence in the later fixed-slot graph phase.
+    virtual void release_window(int64_t layer) { release_layer(layer, nullptr); }
+
+    /// Whether the source as a whole returns pointers whose lifetime is bounded by a layer.  The per-expert form
+    /// below remains for native file shards, which can mix persistent and transient experts.
+    virtual bool transient() const { return false; }
+
     /// A file-backed source: start reading this expert's pages now (it will be needed by the CPU); no-op elsewhere.
     virtual void prefetch(int64_t layer, int64_t expert) { (void) layer; (void) expert; }
     /// A file-backed source: this expert lives in VRAM, so its pages need not stay in RAM - hand them back to the
@@ -260,10 +281,16 @@ struct ExpertDispatch {
     // admitted and filled from the arena.  No eviction, because eviction policy is the measured question
     // (`R4.1`'s LFU-decay vs LRU sweep) and a placeholder would set the hit rate everything is sized against.
     ExpertCache* cache = nullptr;
+    /// A profile-filled Ring cache is fixed for the whole run: routed misses stay on the CPU and never admit a new
+    /// source blob into VRAM.  This keeps the bounded host slots independent from the asynchronous decode path.
+    bool cache_static = false;
     int64_t cache_hits = 0;      ///< lookups already resident
     int64_t cache_admitted = 0;  ///< lookups that took a slot
     int64_t cache_refused = 0;   ///< lookups with no slot free (the cache is full)
     void* cache_stream = nullptr;
+    /// The event that gates the previous layer's bounded-source slots on the decode path.  It is recorded on
+    /// `cache_stream` before the next layer begins; persistent sources ignore the release call.
+    void* release_ev = nullptr;
     const char* cache_fail = nullptr;
 
     // ================================ R4.2c: THE HITS GO TO THE GPU ================================
@@ -339,6 +366,8 @@ struct ExpertDispatch {
     }
 
     std::vector<strata::kernels::cpu::ExpertJob> jobs;
+    /// Reused scratch for a transient source: GPU cache hits do not need a Ring blob or a host-slot hold.
+    std::vector<int32_t> source_ids;
     strata::kernels::cpu::ActQ act;
     /// Plan v0.3 P6 verify window: one quantized activation per token, the multi-token jobs, and the expert ->
     /// job map (reset after every layer).
@@ -650,6 +679,104 @@ private:
 // It reads `experts.bin` into a `PinnedArena` once at startup, so the expert stream comes from anonymous memory
 // the OS has no cheaper reason to evict.  `PinnedArena` also tries `cudaHostRegister`, which the GPU needs for
 // Phase 3's cache fills and the CPU/PCIe miss split - but registration is best-effort and reported, not assumed.
+// ================================ THE BOUNDED RING ================================
+//
+// A fixed set of page-locked slots replaces the whole resident arena when the caller supplies an expert-RAM
+// budget.  It is deliberately limited to the canonical Q2_0 experts.bin layout for this first integration: native
+// GGUF assembly, verifier DMA, and direct GPU aliases stay disabled until their lifetimes are audited separately.
+class RingExpertSource : public ExpertSource {
+public:
+    RingExpertSource() = default;
+    ~RingExpertSource() override;
+    RingExpertSource(const RingExpertSource&) = delete;
+    RingExpertSource& operator=(const RingExpertSource&) = delete;
+
+    bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, uint64_t ram_bytes, std::string& err);
+    void set_gguf(const std::string& shard1) { gguf_ = shard1; }
+    /// Add a bounded Resident-RAM tier. The Ring remains the fallback for complement experts not held there;
+    /// ownership stays with the caller and the source must outlive this Ring.
+    void set_resident(FileExpertSource* resident) { resident_ = resident; }
+    /// Reserve the tail of the same Ring arena for a multi-token verifier. Set before open(); normal single-token
+    /// admission never uses these slots. This is only the fixed-slot groundwork; graph execution uses it later.
+    void set_verifier_reserve_slots(int64_t slots) { verifier_reserve_requested_ = std::max<int64_t>(0, slots); }
+    int64_t normal_slots() const { return normal_slots_; }
+    int64_t verifier_slots() const { return verifier_slots_; }
+    void close();
+
+    bool mapped() const { return base_ != nullptr; }
+    int64_t blobs() const { return blobs_; }
+    const uint8_t* blob(int64_t layer, int64_t expert) override;
+    bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
+    int64_t reads() const override { return reads_ + (resident_ != nullptr ? resident_->ram_reads() : 0); }
+    bool pinned(int64_t layer, int64_t expert) const override;
+    /// Direct PCIe aliases are intentionally disabled in the bounded-RAM port.  `slot_device` remains available for
+    /// the future GPU-cache integration after its event lifetime has been audited.
+    const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+    bool begin_window(int64_t layer, const int32_t* ids, int64_t n) override;
+    int64_t acquire(int64_t layer, int64_t expert);
+    void release_layer(int64_t layer, void* after_event) override;
+    void release_window(int64_t layer) override;
+    bool transient(int64_t layer, int64_t expert) const override;
+    bool transient() const override { return true; }
+
+    const uint8_t* slot_host(int64_t s) const {
+        return base_ == nullptr || s < 0 || s >= slots_ ? nullptr : base_ + (uint64_t) s * (uint64_t) slot_bytes_;
+    }
+    const uint8_t* slot_device(int64_t s) const {
+        return dev_ == nullptr || s < 0 || s >= slots_ ? nullptr : dev_ + (uint64_t) s * (uint64_t) slot_bytes_;
+    }
+
+    int64_t slots() const { return slots_; }
+    int64_t slot_bytes() const { return slot_bytes_; }
+    int64_t hits() const { return hits_; }
+    int64_t misses() const { return misses_; }
+    int64_t evictions() const { return evictions_; }
+    int64_t thrash() const { return thrash_; }
+
+private:
+    struct Slot {
+        int64_t layer = -1, expert = -1;
+        bool held = false;
+        bool verifier_held = false;
+        uint64_t verifier_age = 0;
+        void* gate = nullptr;
+        std::list<int64_t>::iterator lru{};
+    };
+    bool read_blob(int64_t layer, int64_t expert, uint8_t* dst);
+    int64_t acquire_unlocked(int64_t layer, int64_t expert);
+    int64_t acquire_verifier_unlocked(int64_t layer, int64_t expert);
+    int64_t reusable_slot();
+    int64_t reusable_verifier_slot();
+    static bool gate_done(const void* gate);
+
+    void* arena_ = nullptr;
+    uint8_t* base_ = nullptr;
+    const uint8_t* dev_ = nullptr;
+    std::vector<Slot> slot_;
+    std::vector<int64_t> index_;
+    std::list<int64_t> lru_;
+    std::vector<int64_t> layer_slots_;
+    std::vector<int64_t> verifier_layer_slots_;
+    int64_t cur_layer_ = -1;
+    int64_t verifier_cur_layer_ = -1;
+    int64_t verifier_reserve_requested_ = 0;
+    int64_t normal_slots_ = 0;
+    int64_t verifier_slots_ = 0;
+    uint64_t verifier_age_ = 0;
+    bool verifier_active_ = false;
+    int64_t slots_ = 0;
+    int64_t slot_bytes_ = 0;
+    int64_t blobs_ = 0;
+    int64_t n_expert_ = 0;
+    int64_t held_layer_ = -1;
+    int64_t reads_ = 0, hits_ = 0, misses_ = 0, evictions_ = 0, thrash_ = 0;
+    std::string gguf_, path_;
+    std::FILE* file_ = nullptr;
+    FileExpertSource* resident_ = nullptr;  ///< non-owning bounded resident complement, when hybrid mode is enabled
+    mutable std::mutex mu_;
+};
+
 class ArenaExpertSource : public ExpertSource {
 public:
     ArenaExpertSource() = default;
@@ -669,7 +796,7 @@ public:
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
-    int64_t reads() const { return reads_; }
+    int64_t reads() const override { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     void prefetch(int64_t layer, int64_t expert) override;

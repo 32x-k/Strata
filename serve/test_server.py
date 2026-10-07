@@ -21,8 +21,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, StrataEngine,  # noqa: E402
-                          engine_args, layer_split_value, prompt_tokens_seen, request_timings, serve,
-                          start_failure_hint)
+                          engine_args, layer_split_value, measured_decode_rate, prompt_tokens_seen, request_timings,
+                          serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1333,6 +1333,30 @@ class CancelledRead(unittest.TestCase):
         self.assertEqual([r["prompt_total"] for r in rows], [total] * 3)
         self.assertEqual([(r["prompt_tokens"], r["prompt_read"]) for r in rows], [(8, 8), (total, 20), (total, None)])
         self.assertEqual(m["totals"]["prompt_tokens"], 8 + 2 * total)
+
+
+class DecodeTiming(unittest.TestCase):
+    def test_engine_clock_wins_over_buffered_output_burst(self):
+        self.assertAlmostEqual(measured_decode_rate({"generated": 58, "decode_ms": 8600.0}, 1), 58 / 8.6)
+        self.assertIsNone(measured_decode_rate({"generated": 58, "decode_ms": 0.0}, 58))
+        self.assertIsNone(measured_decode_rate({}, 58))
+
+    def test_done_log_uses_engine_clock(self):
+        class Buffered(MockEngine):
+            buffered_output = True
+
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                values = self.script[:max_new]
+                self.last = {"generated": len(values), "prompt_tokens": len(ids), "prompt_ms": 100.0,
+                             "decode_ms": 200.0, "finish": "stop"}
+                yield from values
+
+        tok = ByteTokenizer()
+        engine = Buffered(tok, "x", max_context=CTX)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            list(svc.run([1], True, [], 10, {}, threading.Event()))
+        self.assertIn("10.0 tok/s", out.getvalue())
 
 
 class LiveRate(unittest.TestCase):

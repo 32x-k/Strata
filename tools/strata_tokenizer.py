@@ -137,6 +137,23 @@ class Tokenizer:
                    md.get("tokenizer.ggml.pre", "qwen35"), special)
 
     # -------------------------------------------------------------- the algorithm
+    @classmethod
+    def from_pack(cls, path) -> "Tokenizer":
+        """Load the tokenizer exported beside a pack, without opening any weight shard."""
+        path = pathlib.Path(path)
+        vocab = json.loads((path / "vocab.json").read_text(encoding="utf-8"))
+        n = max(vocab.values(), default=-1) + 1
+        tokens = [""] * n
+        for token, index in vocab.items():
+            tokens[int(index)] = token
+        merges_path = path / "merges.txt"
+        merges = merges_path.read_text(encoding="utf-8").splitlines() if merges_path.exists() else []
+        types_path = path / "token_type.json"
+        types = json.loads(types_path.read_text(encoding="utf-8")) if types_path.exists() else None
+        cfg_path = path / "tokenizer.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+        return cls(tokens, merges, types, cfg.get("pre", "qwen35"), cfg.get("special_ids") or {})
+
     def _bpe(self, word: str) -> list[str]:
         """Merge `word` (already byte-mapped) by LOWEST RANK first, repeatedly - not left to right.
 

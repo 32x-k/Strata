@@ -94,6 +94,23 @@ PP_FLOOR_TOK_S = 50.0
 PP_SLACK = 3.0
 
 
+def measured_decode_rate(last: dict | None, generated: int) -> float | None:
+    """Return the engine's decode rate when it supplied a decode clock.
+
+    A one-shot adapter can finish the expensive work before it yields any token IDs to the service.  In that case a
+    wall-clock rate measured between yielded IDs is the transport burst rate, not the model's decode rate.  Resident
+    engines also have a more accurate clock here because it excludes prompt reading.
+    """
+    if not isinstance(last, dict):
+        return None
+    try:
+        count = int(last.get("generated") or generated)
+        decode_ms = float(last.get("decode_ms") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return count / (decode_ms / 1000.0) if count > 0 and decode_ms > 0.0 else None
+
+
 # ------------------------------------------------------------------------------------------------ engines
 class Engine(Protocol):
     max_context: int
@@ -1956,7 +1973,14 @@ class Service:
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
-        the sum of theirs."""
+        the sum of theirs.  A buffered one-shot adapter uses the engine's decode clock instead of the output burst."""
+        if getattr(self.engine, "buffered_output", False):
+            with self.status_lock:
+                s = dict(self.status)
+            if s.get("busy") and s.get("first_token"):
+                measured = measured_decode_rate(getattr(self.engine, "last", None), s.get("generated", 0))
+                if measured is not None:
+                    return measured
         with self.status_lock:
             many = [(dict(st), list(rt)) for st, rt in self.live_reqs.values()]
         if many:
@@ -1979,6 +2003,13 @@ class Service:
 
     def _tok_s_mean(self):
         """The whole-request mean since the first token (the old formula), kept so the two can be compared."""
+        if getattr(self.engine, "buffered_output", False):
+            with self.status_lock:
+                s = dict(self.status)
+            if s.get("busy") and s.get("first_token"):
+                measured = measured_decode_rate(getattr(self.engine, "last", None), s.get("generated", 0))
+                if measured is not None:
+                    return measured
         with self.status_lock:
             many = [dict(st) for st, _ in self.live_reqs.values()] or [dict(self.status)]
         return sum(s["generated"] / max(1e-6, time.time() - s["first_token"]) for s in many
@@ -2236,8 +2267,16 @@ class Service:
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
             print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
-            rate = s["generated"] / max(1e-6, now - s["first_token"])
-            print(f"[strata] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
+            display_n = s["generated"]
+            engine_last = getattr(self.engine, "last", None) or {}
+            rate = measured_decode_rate(engine_last, display_n) \
+                if getattr(self.engine, "buffered_output", False) else None
+            if rate is not None:
+                # The adapter has already completed the whole one-shot run before its first ID reaches Service.
+                display_n = int(engine_last.get("generated") or display_n)
+            else:
+                rate = display_n / max(1e-6, now - s["first_token"])
+            print(f"[strata] {s['phase']}: {display_n} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
 
@@ -2432,7 +2471,9 @@ class Service:
                             now = time.time()
                             el = now - st.get("started", now)
                             ft = st.get("first_token")
-                            rate = n / max(1e-6, now - ft) if ft else 0.0
+                            rate = measured_decode_rate(last, n)
+                            if rate is None:
+                                rate = n / max(1e-6, now - ft) if ft else 0.0
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
@@ -3030,7 +3071,9 @@ def make_handler(svc: Service):
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "loaded": svc.loaded(), "service": "strata", "ring": bool(getattr(svc, "ring_mode", False)),
+                                 "ring_mode": getattr(svc.engine, "info", {}).get("ring_mode") if
+                                 getattr(svc, "ring_mode", False) else None})
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
                     return
