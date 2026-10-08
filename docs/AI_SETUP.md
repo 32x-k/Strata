@@ -1,5 +1,7 @@
 # Installing Strata for a user (instructions for AI agents)
 
+日本語版：[AI_SETUP.ja.md](AI_SETUP.ja.md)
+
 This page is written for an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...) that a user asked to
 set up Strata on their PC. Strata runs the Qwen3.8-Flash-Next model locally on one NVIDIA or AMD graphics card plus
 system RAM, and serves an OpenAI- and Anthropic-compatible API on `http://127.0.0.1:8080`. The human-oriented
