@@ -288,6 +288,10 @@ struct ExpertDispatch {
     /// A profile-filled Ring cache is fixed for the whole run: routed misses stay on the CPU and never admit a new
     /// source blob into VRAM.  This keeps the bounded host slots independent from the asynchronous decode path.
     bool cache_static = false;
+    /// Fixed-profile Ring decode: release host slots without waiting for the current GPU hit kernel.
+    bool static_ring_overlap = false;
+    int64_t hit_stage_layers = 0;
+    int64_t hit_stage_stride = 0;
     int64_t cache_hits = 0;      ///< lookups already resident
     int64_t cache_admitted = 0;  ///< lookups that took a slot
     int64_t cache_refused = 0;   ///< lookups with no slot free (the cache is full)
@@ -324,7 +328,11 @@ struct ExpertDispatch {
     float* x_q8_0_hit_scale = nullptr;
     int32_t* d_slot = nullptr;             ///< device, K entries
     int32_t* d_dst = nullptr;              ///< device, K entries
-    std::vector<int32_t> h_slot, h_dst;    ///< host staging, sized at session setup
+    std::vector<int32_t> h_slot, h_dst;    ///< shared staging for the fenced/legacy path
+    /// Static Ring overlap: per-layer copy sources and completion events guard reuse of the two host lists.
+    std::vector<int32_t> h_slot_by_layer, h_dst_by_layer;
+    std::vector<void*> h_slot_copy_events_by_layer, h_dst_copy_events_by_layer;
+    std::vector<uint8_t> h_slot_copy_pending_by_layer, h_dst_copy_pending_by_layer;
     /// **PER ROUTER INDEX, DECIDED IN `Launch` AND CONSUMED BY THE POOL.**  The two callbacks share it
     /// so the decision is made exactly once, on this layer's ids, and neither side can re-decide it.
     std::vector<uint8_t> is_hit;

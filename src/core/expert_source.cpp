@@ -2822,15 +2822,23 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 
     // Bound a transient source's previous layer to the actual CUDA stream timeline.  `cache_stream` is also the
     // stream used by the hit path in cache-enabled builds; the bounded-ring path installs it even without a cache.
-    if (d.src != nullptr && d.cache_stream != nullptr && d.release_ev != nullptr && d.layers >= LAG_DECODE) {
-        const cudaError_t e = cudaEventRecord((cudaEvent_t) d.release_ev, (cudaStream_t) d.cache_stream);
-        if (e != cudaSuccess) {
-            d.failed = true;
-            d.fail = "could not record the expert-ring release event";
-            d.fail_layer = d.layers;
-            return;
+    if (d.src != nullptr && d.layers >= LAG_DECODE) {
+        if (d.static_ring_overlap) {
+            // This callback follows the previous dispatch's synchronous pool->run_split(), so every CPU job that
+            // read its Ring blobs has finished. Static-cache hits read only fixed VRAM rows; dynamic admission and
+            // GPU reads from Ring slots are disabled in this mode. Host hit lists use per-layer staging and copy
+            // events; session_loop's final sync completes them before the next token.
+            d.src->release_layer(d.layers - LAG_DECODE, nullptr);
+        } else if (d.cache_stream != nullptr && d.release_ev != nullptr) {
+            const cudaError_t e = cudaEventRecord((cudaEvent_t) d.release_ev, (cudaStream_t) d.cache_stream);
+            if (e != cudaSuccess) {
+                d.failed = true;
+                d.fail = "could not record the expert-ring release event";
+                d.fail_layer = d.layers;
+                return;
+            }
+            d.src->release_layer(d.layers - LAG_DECODE, d.release_ev);
         }
-        d.src->release_layer(d.layers - LAG_DECODE, d.release_ev);
     }
 
     // A bounded source must not read a second host blob for an expert the VRAM tier already owns.  This is
@@ -3243,6 +3251,12 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
     ExpertDispatch& d = *(ExpertDispatch*) user;
     if (d.failed) return;
     cudaStream_t cs = (cudaStream_t) stream;
+    if (d.static_ring_overlap && cs != (cudaStream_t) d.cache_stream) {
+        d.failed = true;
+        d.fail = "static Ring overlap requires hit copies and kernels on the release stream";
+        d.fail_layer = d.layers;
+        return;
+    }
 
     if (phase == HitPhase::Launch) {
         d.decided = false;
@@ -3256,6 +3270,55 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
         // admitted and filled if there is room (which makes it a hit on THIS call, because the fill and the
         // kernel are on one stream in that order), and otherwise it stays a miss for the CPU.
         d.n_hits = 0;
+        int32_t* h_slot = d.h_slot.data();
+        int32_t* h_dst = d.h_dst.data();
+        if (d.static_ring_overlap) {
+            const size_t layers = (size_t) d.hit_stage_layers;
+            if (d.layers < 0 || d.layers >= d.hit_stage_layers || d.hit_stage_stride < k ||
+                d.h_slot_by_layer.size() < layers * (size_t) d.hit_stage_stride ||
+                d.h_dst_by_layer.size() < layers * (size_t) d.hit_stage_stride ||
+                d.h_slot_copy_events_by_layer.size() < layers || d.h_dst_copy_events_by_layer.size() < layers ||
+                d.h_slot_copy_pending_by_layer.size() < layers || d.h_dst_copy_pending_by_layer.size() < layers) {
+                d.failed = true;
+                d.fail = "the static Ring hit staging has no slot for this layer";
+                d.fail_layer = d.layers;
+                return;
+            }
+            const size_t layer = (size_t) d.layers;
+            if (d.h_slot_copy_events_by_layer[layer] == nullptr || d.h_dst_copy_events_by_layer[layer] == nullptr) {
+                d.failed = true;
+                d.fail = "the static Ring hit staging has no copy-completion event";
+                d.fail_layer = d.layers;
+                return;
+            }
+            // Each host list waits only on the event recorded after its own H2D copy, before this layer's segment is reused.
+            if (d.h_slot_copy_pending_by_layer[layer]) {
+                const cudaError_t e = cudaEventSynchronize((cudaEvent_t) d.h_slot_copy_events_by_layer[layer]);
+                if (e != cudaSuccess) {
+                    d.failed = true;
+                    d.hit_fail = "the previous slot-list copy did not finish before its source buffer was reused";
+                    d.fail = d.hit_fail;
+                    d.fail_layer = d.layers;
+                    return;
+                }
+                d.h_slot_copy_pending_by_layer[layer] = 0;
+            }
+            if (d.h_dst_copy_pending_by_layer[layer]) {
+                const cudaError_t e = cudaEventSynchronize((cudaEvent_t) d.h_dst_copy_events_by_layer[layer]);
+                if (e != cudaSuccess) {
+                    d.failed = true;
+                    d.hit_fail = "the previous destination-list copy did not finish before its source buffer was reused";
+                    d.fail = d.hit_fail;
+                    d.fail_layer = d.layers;
+                    return;
+                }
+                d.h_dst_copy_pending_by_layer[layer] = 0;
+            }
+            // The one-stream guard makes session_loop's final sync cover every such transfer, including error cleanup.
+            const size_t offset = layer * (size_t) d.hit_stage_stride;
+            h_slot = d.h_slot_by_layer.data() + offset;
+            h_dst = d.h_dst_by_layer.data() + offset;
+        }
         for (int64_t i = 0; i < k; ++i) {
             const int64_t e = ids[i];
             d.is_hit[(size_t) i] = 0;
@@ -3291,8 +3354,8 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
                 ++d.cache_hits;
             }
             d.is_hit[(size_t) i] = 1;
-            d.h_slot[(size_t) d.n_hits] = slot;
-            d.h_dst[(size_t) d.n_hits] = (int32_t) i;
+            h_slot[(size_t) d.n_hits] = slot;
+            h_dst[(size_t) d.n_hits] = (int32_t) i;
             ++d.n_hits;
         }
         d.decided = true;
@@ -3302,14 +3365,30 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
         // `hit_out` is ZEROED rather than overwritten: the kernel writes only the rows this layer's hits own,
         // so a row that was a hit last layer and a miss this one would still hold last layer's expert and
         // `add_inplace` would sum it in.  Finite, plausible, wrong.
-        if (cudaMemsetAsync(d.hit_out, 0, (size_t) d.parts_elems * sizeof(float), cs) != cudaSuccess ||
-            cudaMemcpyAsync(d.d_slot, d.h_slot.data(), list_bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
-            cudaMemcpyAsync(d.d_dst, d.h_dst.data(), list_bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess) {
-            d.hit_fail = "the hit list could not be staged";
+        if (cudaMemsetAsync(d.hit_out, 0, (size_t) d.parts_elems * sizeof(float), cs) != cudaSuccess) {
+            d.hit_fail = "the hit output could not be zeroed";
             d.failed = true;
             d.fail = d.hit_fail;
             return;
         }
+        if (cudaMemcpyAsync(d.d_slot, h_slot, list_bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+            (d.static_ring_overlap && cudaEventRecord(
+                (cudaEvent_t) d.h_slot_copy_events_by_layer[(size_t) d.layers], cs) != cudaSuccess)) {
+            d.hit_fail = "the hit slot list could not be staged";
+            d.failed = true;
+            d.fail = d.hit_fail;
+            return;
+        }
+        if (d.static_ring_overlap) d.h_slot_copy_pending_by_layer[(size_t) d.layers] = 1;
+        if (cudaMemcpyAsync(d.d_dst, h_dst, list_bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+            (d.static_ring_overlap && cudaEventRecord(
+                (cudaEvent_t) d.h_dst_copy_events_by_layer[(size_t) d.layers], cs) != cudaSuccess)) {
+            d.hit_fail = "the hit destination list could not be staged";
+            d.failed = true;
+            d.fail = d.hit_fail;
+            return;
+        }
+        if (d.static_ring_overlap) d.h_dst_copy_pending_by_layer[(size_t) d.layers] = 1;
         // The activation is quantized HERE rather than reused from `s.moe.x_q8_0`, which `post[l-1]` wrote from
         // the PREVIOUS layer's `mixed`.  `pre[l]` has since overwritten `mixed`, so that buffer is a layer stale
         // - and a stale activation produces a perfectly finite expert for the wrong input.

@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-10",
+  "hardware": {
+    "gpu": "AMD Radeon AI PRO R9700",
+    "gpu_architecture": "gfx1201",
+    "gpu_memory_gib": 31.9,
+    "cpu": "AMD Ryzen AI 9 HX 370",
+    "system_ram_gib": 27.6,
+    "os": "Windows",
+    "backend": "HIP"
+  },
+  "workload": {
+    "model": "canonical indexed Q2_0",
+    "provided_prompt_token_ids": 512,
+    "reported_prompt_tokens": 511,
+    "generated_tokens": 1000,
+    "sampling": "greedy",
+    "ring_gib": 17,
+    "static_gpu_cache_experts": 20201,
+    "pool_workers": 7,
+    "kv": "int8",
+    "unbuffered_io": true,
+    "stager_batch": 8,
+    "trace_enabled_during_performance_runs": false
+  },
+  "buffer_reuse_safeguard": {
+    "host_buffers": "Separate per-layer staging segments for slot IDs and destination IDs.",
+    "completion_events": "One event per host buffer per layer, recorded on the transfer stream after its H2D copy.",
+    "reuse_rule": "Synchronize that buffer's event before rewriting its layer segment.",
+    "stream_rule": "The supported mode uses the main single stream; runtime checks reject a different hit-copy stream.",
+    "cleanup_rule": "session_loop synchronizes the stream at token end; error cleanup drains it before staging and event destruction."
+  },
+  "performance_ab": {
+    "run_order": [
+      "fenced-1",
+      "overlap-1",
+      "fenced-2",
+      "overlap-2",
+      "fenced-3",
+      "overlap-3"
+    ],
+    "fenced_mode": {
+      "environment": "STRATA_RING_STATIC_CACHE_OVERLAP=0",
+      "decode_ms": [45065.7, 44392.9, 49461.6],
+      "decode_tokens_per_second": [22.19, 22.53, 20.22],
+      "expert_pool_dispatch_ms_per_token": [9.471, 9.166, 10.135],
+      "combined_tokens_per_second": 21.60
+    },
+    "static_cache_overlap_mode": {
+      "environment": "STRATA_RING_STATIC_CACHE_OVERLAP=1",
+      "decode_ms": [43804.0, 44299.9, 54760.1],
+      "decode_tokens_per_second": [22.83, 22.57, 18.26],
+      "expert_pool_dispatch_ms_per_token": [5.115, 5.306, 5.333],
+      "combined_tokens_per_second": 21.00
+    },
+    "combined_speed_change_percent": -2.76,
+    "expert_pool_dispatch_change_percent": -45.2,
+    "all_six_1000_token_outputs_identical": true,
+    "interpretation": "The dispatch metric fell, but combined decode throughput did not improve in this six-run set. The third pair slowed in both modes; temperature, power state and background load were not recorded. This set does not establish a repeatable throughput gain.",
+    "limitations": [
+      "One prompt and one Windows AMD GPU were tested.",
+      "The fenced and overlap runs were interleaved; temperature, power state and background load were not recorded.",
+      "The dispatch metric includes source preparation and activation quantization, not only CPU expert computation.",
+      "The performance runs used no Ring trace instrumentation."
+    ]
+  },
+  "default_mode_confirmation": {
+    "environment": "STRATA_RING_STATIC_CACHE_OVERLAP unset",
+    "generated_tokens": 1000,
+    "decode_ms": 54448.6,
+    "decode_tokens_per_second": 18.37,
+    "output_identical_to_fenced_baseline": true,
+    "stderr_confirmed_release_fence_bypass": true
+  },
+  "fenced_followup": {
+    "environment": "STRATA_RING_STATIC_CACHE_OVERLAP=0",
+    "generated_tokens": 1000,
+    "decode_ms": 54807.3,
+    "decode_tokens_per_second": 18.25,
+    "output_identical_to_fenced_baseline": true,
+    "note": "One sequential confirmation run, not a paired performance estimate."
+  },
+  "access_trace_smoke": {
+    "environment": "STRATA_RING_STATIC_CACHE_OVERLAP unset",
+    "generated_tokens": 128,
+    "output_matches_fenced_1000_token_prefix": true,
+    "pre_pool_release_events": 2670,
+    "pre_pool_releases_without_event": 2670,
+    "pre_pool_sync_calls": 0,
+    "release_event_scope": "Ring slot release fence; separate hit-list H2D completion events are still recorded and awaited before host-buffer reuse.",
+    "token_tail_release_events": 21,
+    "note": "Access tracing queries release events and adds overhead; this smoke verifies the selected path, not performance."
+  }
+}

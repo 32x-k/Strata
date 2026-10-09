@@ -197,10 +197,17 @@ maximum Resident complement and the Ring receives the remainder of the same `--e
 Resident allocation is attempted before the remainder Ring is committed; if its physical-RAM or Windows-commit safety
 check fails, the Resident copy is released and the full bounded Ring is used instead.
 
-The ring disables the captured token graph and records a CUDA/HIP event before releasing each layer's slots. This
-keeps CPU reads, host-to-device copies and GPU consumers ordered. A small ring is useful for correctness/eviction tests,
-not as a performance setting; a profile-filled GPU cache is a separate static experiment and still uses the normal
-per-layer release path.
+The ring disables the captured token graph. In ordinary paths that use the per-layer pool callback, it records a
+CUDA/HIP event before releasing slots. One exception is direct, non-speculative single-stream generation with a
+static GPU cache: this path releases a layer's slots without waiting for the hit-kernel event. The prior pool callback
+has joined its CPU jobs, cache hits read fixed VRAM rows, and dynamic GPU admission is disabled. Host hit lists use per-layer staging buffers. Each slot-list and destination-list copy records a buffer-specific event
+on the main stream; the matching event is synchronized before that layer's host segment is reused. The supported mode
+rejects a different copy stream. `session_loop` synchronizes the main stream at token end, and an error path drains it
+before destroying the staging buffers or events. This release-fence bypass is enabled by default only for that mode. Set
+`STRATA_RING_STATIC_CACHE_OVERLAP=0` to restore the event wait; `=1` requests the mode and refuses unsupported
+combinations such as `--serve`, speculative decoding, hybrid Ring, batching, multiple GPUs, `--no-pool` or
+`--no-capture`. The verifier uses its separate fixed-slot lifetime. A small ring remains useful for correctness and eviction tests, not as a performance
+setting.
 
 On Windows, Ring chooses buffered or `FILE_FLAG_NO_BUFFERING` reads at startup; `STRATA_UNBUFFERED_LOAD=1` forces
 unbuffered reads and `=0` forces the file cache. With unbuffered I/O active, nearby expert ranges are merged into
@@ -213,8 +220,9 @@ part of the `--expert-ram-gb` slot cap, which is not a process-wide RAM limit. T
 
 `STRATA_RING_TRACE=FILE` opts into a JSONL diagnostic trace for ordinary, non-speculative Ring decode. It records
 token latency, 100-token bins, Ring and I/O counters, and HIP memory. `STRATA_RING_ACCESS_TRACE=FILE` records Ring
-requests, hit/miss, victims, releases and I/O batches; it is rejected for speculative, serve and hybrid runs. Keep
-both unset for normal use; they are diagnostics, not performance settings.
+requests, hit/miss, victims, releases and I/O batches; release rows without an event use status -1, which the
+`tools/ring_release_sync_report.py` summary counts separately. Access tracing is rejected for speculative, serve and
+hybrid runs. Keep both variables unset for normal use; they are diagnostics, not performance settings.
 
 [`tools/ring_policy_sim.py`](../tools/ring_policy_sim.py) replays a request trace with LRU, SLRU,
 decaying-LFU and trace-cost-weighted LFU policies without changing runtime behavior. It is hardware-independent;
@@ -232,9 +240,11 @@ general GPU benchmark.
 
 **Sustained Q2_0 Ring decode (2026-10-08):** on the Windows R9700 and a Ryzen AI 9 HX 370 system with 27.6 GiB RAM, a 511-token prompt was followed by 1,000-token greedy runs. The setup used a 17 GiB Ring, a static 20,201-expert GPU cache, seven pool workers, `int8` KV, unbuffered reads and stager batch 8. Three untraced runs measured 21.14, 20.48 and 19.21 tok/s (20.24 tok/s combined); a later trace-enabled set measured 21.30, 21.37 and 21.61 tok/s (21.43 tok/s combined). Outputs matched, but the 5.9% gap between groups is unexplained: temperature, power state and background load were not recorded. Do not treat it as a code speedup or as a paired trace-overhead measurement. A 2,000-token run measured 20.32 tok/s without tracing and 21.08 tok/s with tracing; their first 1,000 tokens matched.
 
-The three trace-enabled 1,000-token runs produced 46.67 ms mean token latency, with p50 46.09 ms, p95 53.52 ms and p99 58.12 ms. Each run recorded 580 Ring misses, 801.8 MB of payload, about 541 ms of cumulative I/O wait and zero thrash. Cumulative I/O wait can overlap other work. The process working set reached 18,236 MiB and free physical RAM fell to 1,329 MiB; the 17 GiB option limits Expert slots, not total process or system RAM. CPU pool time averaged 9.54 ms/token and `host after ring` 22.98 ms/token. A separate GPU-only graph replay measured 10.76 ms/token, but uses a different path and cannot be subtracted to attribute normal decode time. Windows utilization counters returned zero and were not valid; GPU-stage differencing also produced inconsistent totals.
+The three trace-enabled 1,000-token runs produced 46.67 ms mean token latency, with p50 46.09 ms, p95 53.52 ms and p99 58.12 ms. Each run recorded 580 Ring misses, 801.8 MB of payload, about 541 ms of cumulative I/O wait and zero thrash. Cumulative I/O wait can overlap other work. The process working set reached 18,236 MiB and free physical RAM fell to 1,329 MiB; the 17 GiB option limits Expert slots, not total process or system RAM. Before the release-fence bypass, CPU pool dispatch averaged 9.54 ms/token and `host after ring` 22.98 ms/token. Dispatch time includes source preparation, activation quantization, pool work and, in that build, Ring release synchronization; it is not CPU expert compute alone. A separate GPU-only graph replay measured 10.76 ms/token, but uses a different path and cannot be subtracted to attribute normal decode time. Windows utilization counters returned zero and were not valid; GPU-stage differencing also produced inconsistent totals.
 
-Seven pool workers were faster in this comparison than five or two, with all outputs matching. A `--spec 4` run reached 34.68 tok/s but diverged from the baseline at token 6, so it is not an output-equivalent speed result. The [run table, trace bins and diagnostic notes](../bench/results/2026-10-08-q2-ring-sustained/README.md) contain the measurements and limitations.
+Seven pool workers were faster in this comparison than five or two, with all outputs matching. A `--spec 4` run reached 34.68 tok/s but diverged from the baseline at token 6, so it is not an output-equivalent speed result.
+
+**Static-cache release-fence A/B (2026-10-10):** the same 511-token prompt and 1,000-token greedy decode ran three times per mode, alternating fenced and bypass runs, with no tracing. The R9700 used a 17 GiB Ring, 20,201 static GPU-cache experts, seven workers, `int8` KV, unbuffered reads and stager batch 8. The fenced runs measured 22.19, 22.53 and 20.22 tok/s (21.60 combined); the bypass runs measured 22.83, 22.57 and 18.26 tok/s (21.00 combined). All six outputs matched. `Drive::cpu_ms` expert pool dispatch averaged 9.59 ms/token fenced and 5.25 ms/token with bypass, but this includes source preparation and activation quantization. Combined decode throughput was 2.76% lower with bypass in this set; the last pair slowed in both modes, and temperature, power state and background load were not recorded. These results do not establish a repeatable throughput gain. One unpaired default-mode run measured 18.37 tok/s and a following `=0` run measured 18.25 tok/s; both reproduced the fenced output, but they are not a performance comparison. The bypass is enabled by default only for direct, non-speculative single-stream generation with a non-empty static cache; `STRATA_RING_STATIC_CACHE_OVERLAP=0` restores the event wait. An access-trace smoke confirmed 2,670 pre-pool Ring-slot releases without passing the Ring-release event; the separate hit-list copy events remain enabled. Tracing was not active for the performance runs. These results cover one prompt on one Windows AMD GPU. See the [A/B data and limitations](../bench/results/2026-10-08-q2-ring-sustained/ring-static-release-ab.json) and the [run table and diagnostics](../bench/results/2026-10-08-q2-ring-sustained/README.md) for details.
 
 On HIP, the shared-expert verifier side stream is opt-in: unset `STRATA_SH_STREAM` (or `=0`) keeps that work on the verifier stream; `=1` enables the fork. On the Windows R9700, a 511-token prompt followed by 128 greedy Q2_0 Ring tokens with MTP spec4 measured 50.01 tok/s with the fork off and 37.37 tok/s with it on. Both runs accepted 90 of 107 drafts in 39 rounds. With a 12-token prompt and 512 generated tokens, two runs per setting averaged 32.03 tok/s off and 26.82 tok/s on; each setting reproduced its own token stream, while the two settings differed from token 143. These are single-card measurements, not a bitwise-equivalence claim. HIP now defaults to off; set `STRATA_SH_STREAM=1` to opt back in.
 
@@ -248,8 +258,11 @@ existing `serve.server` protocol layer and persistent `StrataEngine`; it is text
 time. Both launchers reuse the pack tokenizer and chat template and keep the bounded Hybrid/Ring `--serve` process
 loaded between turns. They share a port, so start only one at a time. The API binds to loopback by default and refuses
 a non-loopback bind without an API key. `--reload-each-turn` on the browser launcher opts into the one-shot diagnostic
-mode. The chat page keeps a compact status strip visible on the Chat tab: bounded Ring RAM, current system RAM, VRAM
-and decode speed; `Details` opens the full Monitor.
+mode. A Windows R9700 smoke test used the Q2_0 hybrid Ring API config (14 GiB expert budget, 6 GiB Resident budget,
+19,390 static GPU-cache experts) and returned `OK` for an OpenAI chat request with a 64-token limit and an 8-token
+reasoning budget. The test bound to `127.0.0.1` and confirmed idle unload; it verifies GPU-backed API generation, not
+API throughput. The chat page keeps a compact status strip visible on the Chat tab: bounded Ring RAM, current system
+RAM, VRAM and decode speed; `Details` opens the full Monitor.
 
 **Resident RAM comparison on Windows AMD:** the fork already contains the upstream `FileExpertSource` resident
 complement. Without `--expert-ram-gb`, `--resident-experts` copies the experts outside the fixed GPU profile into

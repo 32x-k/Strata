@@ -3190,6 +3190,18 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: STRATA_RING_ACCESS_TRACE requires a non-speculative, non-serve, non-hybrid --expert-ram-gb run\n");
         return 2;
     }
+    const bool static_ring_overlap_supported = o.expert_ram_gb > 0 && o.expert_cache != 0 && !profile.empty() &&
+        !hybrid_ring && o.spec <= 0 && o.mtp.empty() && !o.serve && o.batch <= 0 && !o.no_pool &&
+        !o.no_capture && !multi_gpu;
+    const char* static_ring_overlap_env = std::getenv("STRATA_RING_STATIC_CACHE_OVERLAP");
+    const bool static_ring_overlap_override = static_ring_overlap_env != nullptr && static_ring_overlap_env[0] != '\0';
+    const bool static_ring_overlap_requested = static_ring_overlap_override
+        ? std::atoi(static_ring_overlap_env) != 0 : static_ring_overlap_supported;
+    if (static_ring_overlap_requested && !static_ring_overlap_supported) {
+        std::fprintf(stderr, "strata generate: STRATA_RING_STATIC_CACHE_OVERLAP requires a static-profile Ring cache "
+                             "in single-stream, non-speculative generate mode\n");
+        return 2;
+    }
     if (o.expert_ram_gb > 0) {
         const uint64_t total_ram = (uint64_t) o.expert_ram_gb * 1024ull * 1024ull * 1024ull;
         ring_src.set_gguf(o.native_preset);
@@ -3853,6 +3865,17 @@ int main(int argc, char** argv) {
         ~RingEventCleanup() { if (event != nullptr) (void) cudaEventDestroy(event); }
     } ring_release;
     Drive drive;
+    // Declared after Drive so error exits drain the hit-copy stream before Drive's host staging is destroyed.
+    struct HitStagingDrain {
+        cudaStream_t stream = nullptr;
+        bool armed = false;
+        std::vector<cudaEvent_t> copy_events;
+        ~HitStagingDrain() {
+            if (armed && stream != nullptr && cudaStreamSynchronize(stream) != cudaSuccess)
+                (void) cudaDeviceSynchronize();
+            for (cudaEvent_t event : copy_events) if (event != nullptr) (void) cudaEventDestroy(event);
+        }
+    } hit_staging_drain{(cudaStream_t) main_cs};
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
     drive.d.peer = peer.valid() ? &peer : nullptr;
@@ -3861,6 +3884,13 @@ int main(int argc, char** argv) {
     drive.d.pool = &pool;
     drive.d.src = srcp;
     drive.d.cache_static = o.expert_ram_gb > 0 && o.expert_cache > 0 && !profile.empty();
+    drive.d.static_ring_overlap = static_ring_overlap_requested && drive.d.cache_static;
+    if (static_ring_overlap_override && std::atoi(static_ring_overlap_env) != 0 && !drive.d.static_ring_overlap) {
+        std::fprintf(stderr, "strata generate: STRATA_RING_STATIC_CACHE_OVERLAP=1 needs a non-empty static GPU cache\n");
+        return 2;
+    }
+    if (drive.d.static_ring_overlap)
+        std::fprintf(stderr, "strata generate: static Ring release-fence bypass enabled\n");
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
     drive.d.source_ids.reserve((size_t) K);
@@ -3871,6 +3901,10 @@ int main(int argc, char** argv) {
         }
         drive.d.cache_stream = main_cs;
         drive.d.release_ev = (void*) ring_release.event;
+    }
+    if (drive.d.static_ring_overlap && drive.d.cache_stream != (void*) main_cs) {
+        std::fprintf(stderr, "strata generate: static Ring overlap requires the hit and release stream to match\n");
+        return 2;
     }
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
@@ -3936,6 +3970,33 @@ int main(int argc, char** argv) {
         drive.d.d_slot = d_hit_slot;
         drive.d.d_dst = d_hit_dst;
         drive.d.h_slot.resize((size_t) K);
+        if (drive.d.static_ring_overlap) {
+            drive.d.hit_stage_layers = g.n_layers;
+            drive.d.hit_stage_stride = K;
+            drive.d.h_slot_by_layer.resize((size_t) g.n_layers * (size_t) K);
+            drive.d.h_dst_by_layer.resize((size_t) g.n_layers * (size_t) K);
+            drive.d.h_slot_copy_events_by_layer.resize((size_t) g.n_layers);
+            drive.d.h_dst_copy_events_by_layer.resize((size_t) g.n_layers);
+            drive.d.h_slot_copy_pending_by_layer.assign((size_t) g.n_layers, 0);
+            drive.d.h_dst_copy_pending_by_layer.assign((size_t) g.n_layers, 0);
+            hit_staging_drain.copy_events.reserve((size_t) g.n_layers * 2);
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                cudaEvent_t slot_copy_done = nullptr;
+                if (cudaEventCreateWithFlags(&slot_copy_done, cudaEventDisableTiming) != cudaSuccess) {
+                    std::fprintf(stderr, "strata generate: static Ring overlap could not create a slot-list event\n");
+                    return 1;
+                }
+                hit_staging_drain.copy_events.push_back(slot_copy_done);
+                drive.d.h_slot_copy_events_by_layer[(size_t) l] = (void*) slot_copy_done;
+                cudaEvent_t dst_copy_done = nullptr;
+                if (cudaEventCreateWithFlags(&dst_copy_done, cudaEventDisableTiming) != cudaSuccess) {
+                    std::fprintf(stderr, "strata generate: static Ring overlap could not create a destination-list event\n");
+                    return 1;
+                }
+                hit_staging_drain.copy_events.push_back(dst_copy_done);
+                drive.d.h_dst_copy_events_by_layer[(size_t) l] = (void*) dst_copy_done;
+            }
+        }
         cudaEvent_t hit_done = nullptr;
         if (cudaEventCreate(&hit_done) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the hit path could not create its probe event\n");
@@ -8088,10 +8149,17 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                     return 1;
                 }
-            } else if (!strata::core::session_loop(g, pos, /*pos_base=*/0, ss, gr, pool_fn, hit_fn, pool_user, /*overlap=*/true, main_cs,
-                                        err, layer_stage, &loop_scratch)) {
-                std::fprintf(stderr, "strata generate: session_loop: %s\n", err.c_str());
-                return 1;
+            } else {
+                if (drive.d.static_ring_overlap) hit_staging_drain.armed = true;
+                const bool loop_ok = strata::core::session_loop(g, pos, /*pos_base=*/0, ss, gr, pool_fn, hit_fn,
+                                                                 pool_user, /*overlap=*/true, main_cs, err,
+                                                                 layer_stage, &loop_scratch);
+                if (!loop_ok) {
+                    std::fprintf(stderr, "strata generate: session_loop: %s\n", err.c_str());
+                    return 1;
+                }
+                // session_loop's final stream sync has consumed every per-layer host hit-list source.
+                hit_staging_drain.armed = false;
             }
         }
         if (o.expert_ram_gb > 0 && drive.d.release_ev != nullptr && drive.d.layers >= 1) {

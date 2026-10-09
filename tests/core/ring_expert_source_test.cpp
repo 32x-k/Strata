@@ -243,6 +243,66 @@ void test_access_trace(const fs::path& dir) {
             "the access trace is missing phase markers or its summary");
 }
 
+void test_release_without_event_does_not_wait(const fs::path& dir) {
+    using strata::core::RingExpertSource;
+    constexpr int64_t layers = 2, experts = 3;
+    std::string err;
+    RingExpertSource source;
+    require(source.open(dir.string(), layers, experts, (uint64_t) BLOB, err),
+            "could not open the one-slot synthetic ring: " + err);
+    const fs::path trace_path = dir / "ring-release-without-event.jsonl";
+    require(source.start_access_trace(trace_path.string(), err),
+            "could not start the no-event release trace: " + err);
+
+    const int32_t first[] = {0};
+    source.begin_layer(0, first, 1);
+    check_blob(source, 0, 0, 0x20, "no-event layer 0 expert 0");
+
+    cudaStream_t stream = nullptr;
+    cudaEvent_t event = nullptr;
+    check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags");
+    check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "cudaEventCreateWithFlags");
+    CallbackGate gate;
+    check_cuda(cudaLaunchHostFunc(stream, [](void* p) {
+        CallbackGate& g = *(CallbackGate*) p;
+        g.started.store(true, std::memory_order_release);
+        while (!g.allow.load(std::memory_order_acquire)) std::this_thread::yield();
+    }, &gate), "cudaLaunchHostFunc");
+    check_cuda(cudaEventRecord(event, stream), "cudaEventRecord");
+    for (int i = 0; i < 1000 && !gate.started.load(std::memory_order_acquire); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool callback_started = gate.started.load(std::memory_order_acquire);
+    const bool pending_before_release = callback_started && cudaEventQuery(event) == cudaErrorNotReady;
+
+    // The static-cache path has no GPU reader of Ring memory. Releasing with no event must not fence unrelated work.
+    source.release_layer(0, nullptr);
+    const int32_t second[] = {0};
+    source.begin_layer(1, second, 1);  // one-slot ring: reuse the released host slot while the unrelated event is pending
+    const uint8_t* reused = source.blob(1, 0);
+    const bool reused_slot = reused != nullptr && reused[0] == 0x23;
+    const bool pending_after_release = callback_started && cudaEventQuery(event) == cudaErrorNotReady;
+
+    gate.allow.store(true, std::memory_order_release);
+    const cudaError_t stream_status = cudaStreamSynchronize(stream);
+    source.release_layer(1, nullptr);
+    (void) cudaEventDestroy(event);
+    (void) cudaStreamDestroy(stream);
+    source.close();
+
+    require(callback_started, "the unrelated event's host callback did not run");
+    require(pending_before_release && pending_after_release,
+            "release without an event waited for or completed unrelated GPU work");
+    require(reused_slot, "the Ring did not reuse the released one-slot host buffer");
+    check_cuda(stream_status, "cudaStreamSynchronize");
+
+    std::ifstream input(trace_path, std::ios::binary);
+    require((bool) input, "could not read the no-event release trace");
+    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    require(text.find("\"query_status\":-1") != std::string::npos &&
+                text.find("\"sync_status\":-1") != std::string::npos,
+            "the no-event release trace should identify the absent device fence");
+}
+
 void test_event_release_and_final_layer(const fs::path& dir) {
     using strata::core::RingExpertSource;
     constexpr int64_t layers = 2, experts = 3;
@@ -317,6 +377,7 @@ int main() {
         test_fixed_verifier_reservation(dir.path);
         test_batch_copy(dir.path);
         test_access_trace(dir.path);
+        test_release_without_event_does_not_wait(dir.path);
         test_event_release_and_final_layer(dir.path);
         std::puts("ring_expert_source_test: PASS");
         return 0;

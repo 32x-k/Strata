@@ -66,7 +66,7 @@ Windowsでは、RAMリングに入らないExpertを`experts.bin`から読み込
 
 ### Q2_0の持続decode
 
-2026-10-08にR9700で511-token promptの後に1,000 tokensを生成しました。CPUはRyzen AI 9 HX 370、物理RAMは27.6 GiBです。17 GiB Ring、static GPU cache 20,201 experts、7 pool workers、`int8` KV、非バッファードI/O、stager batch 8を使いました。入力には512個のtoken IDを渡し、エンジンはpromptを511 tokensと報告しています。ファイルキャッシュは消去せず、runを逐次実行しました。
+2026-10-08にR9700で511-token promptの後に1,000 tokensを生成しました。CPUはRyzen AI 9 HX 370、物理RAMは27.6 GiBです。17 GiB Ring、static GPU cache 20,201 experts、7 pool workers、`int8` KV、非バッファードI/O、stager batch 8を使いました。入力には512個のtoken IDを渡し、エンジンはpromptを511 tokensと報告しています。ファイルキャッシュは消去せず、runを逐次実行しました。この測定はrelease-fence bypass導入前の結果です。
 
 traceを無効にした3 runは21.14、20.48、19.21 tok/sで、合計decode時間から計算した速度は20.24 tok/sでした。traceを有効にした別の3 runは21.30、21.37、21.61 tok/s、合計で21.43 tok/sでした。6 runの出力はすべて一致しましたが、測定群の間に約5.9%の速度差が残りました。温度や電源状態、バックグラウンド負荷を記録していないため、これをコード変更やtraceの影響とは判断していません。2,000-token runはtraceなしで20.32 tok/s、traceありで21.08 tok/sでした。両方とも先頭1,000 tokensは一致しました。
 
@@ -74,11 +74,37 @@ traceあり1,000-token runを合わせると、token latencyは平均46.67 ms、
 
 1,000-token runのRing missは各580件、payloadは801.8 MB、累積I/O waitは平均541 msでした。thrashはありませんでした。I/O waitは並行処理と重なる可能性のある累積値です。decode時間からそのまま差し引けません。2,000-token runではmissが710件、payloadが981.5 MB、累積I/O waitが683 msで、こちらもthrashはありませんでした。今回の測定ではディスク待ちが主な律速要因だとは確認できませんでした。
 
-trace時のprocess working setの最大値は18,236 MiBです。空き物理RAMは一時1,329 MiBまで減りました。`--expert-ram-gb 17`はExpert slotの上限であり、process working setの上限ではありません。`Drive::cpu_ms`で計測したexpert pool dispatchのwall timeは平均9.54 ms/tokenです。この値にはRing解放時の`cudaEventSynchronize`、source準備、activation quantization、pool処理が含まれ、CPU expert計算だけの時間ではありません。engineの`host after ring`は22.98 ms/tokenです。一方、別経路のGPU-only graph replayは10.76 ms/tokenです。測定経路が違うため、これらを足し引きしてdecode内訳とはみなしません。
+trace時のprocess working setの最大値は18,236 MiBです。空き物理RAMは一時1,329 MiBまで減りました。`--expert-ram-gb 17`はExpert slotの上限であり、process working setの上限ではありません。同期削減前のrunでは、`Drive::cpu_ms`で計測したexpert pool dispatchのwall timeが平均9.54 ms/tokenでした。この値にはRing解放時の`cudaEventSynchronize`、source準備、activation quantization、pool処理が含まれ、CPU expert計算だけの時間ではありません。engineの`host after ring`は22.98 ms/tokenです。一方、別経路のGPU-only graph replayは10.76 ms/tokenです。測定経路が違うため、これらを足し引きしてdecode内訳とはみなしません。
 
 pool worker数を変えたtraceありrunでは、7 workersが21.43 tok/s、5 workersが21.04 tok/s、2 workersが19.94 tok/sでした。出力はいずれも7-worker baselineと一致しました。今回の範囲では7 workersが最速です。`--spec 4`は34.68 tok/sでしたが、出力はtoken 6から異なりました。出力一致が確認できていないため、この速度は採用していません。
 
+### 静的GPU cache使用時のRing解放同期
+
+通常の単一stream decodeで静的GPU cacheを使う場合、Ring slotの解放前にGPU eventを待たない経路を追加しました。直前の`expert_pool_dispatch`は`pool->run_split`が全CPU jobを終えてから戻ります。固定GPU cacheのhit kernelはVRAM内のexpertだけを読み、Ringへの動的admissionも行いません。そのため、CPU側のExpert処理が終わったslotを次層で再利用できます。
+
+slot IDとdestination IDのhost listは層別のstaging領域に分け、各H2D copyの後にbuffer別eventをmain stream上で記録します。
+
+buffer再利用前に待つeventは、そのbufferに対応するcopy eventです。runtimeは異なるcopy streamの指定を受け付けない仕様です。
+
+通常時は`session_loop`がtoken末尾でstreamを同期します。エラー時もstaging領域やeventを破棄する前にstreamを同期します。
+
+この経路は通常の直接生成で自動的に有効です。`STRATA_RING_STATIC_CACHE_OVERLAP=0`を設定すると、従来のevent待ちに戻ります。`=1`は有効化を要求し、静的profile cacheを使わない設定や`--serve`、speculative decoding、hybrid Ring、batch、multi-GPU、`--no-pool`、`--no-capture`では起動を拒否します。これらの経路には変更を適用しません。
+
+同じ511-token promptから1,000 tokensをgreedy生成しました。traceなしで3組を交互に走らせ、17 GiB Ring、20,201-expert GPU cache、7 pool workers、`int8` KV、非バッファードI/O、stager batch 8を使いました。全6 runで出力が一致しています。
+
+event待ちありの各runは22.19、22.53、20.22 tok/s、待ちを省く各runは22.83、22.57、18.26 tok/sでした。合算速度はevent待ちあり21.60 tok/s、待ちなし21.00 tok/sで、この測定では速度向上を確認できませんでした。最後の組では両modeが遅くなりましたが、温度、電源状態、バックグラウンド負荷を記録していません。`Drive::cpu_ms`のexpert pool dispatchは平均9.59から5.25 ms/tokenに減りました。ただしsource準備とactivation quantizationも含みます。
+
+最終ビルドの追加runは、環境変数unsetで18.37 tok/s、`=0`で18.25 tok/sでした。出力は一致しましたが、各1回の連続測定なので性能比較には使いません。
+
+性能測定とは別に128-token access-trace smokeを実行しました。defaultのbypass経路ではpre-pool release 2,670件すべてにRing release eventがなく、release同期は0件でした。出力は1,000-token fenced baselineの先頭128 tokensと一致しています。traceは計測負荷を加えるため、速度測定には使いません。条件と各runの値は[release同期A/B記録](../bench/results/2026-10-08-q2-ring-sustained/ring-static-release-ab.json)にあります。
+
 WindowsのGPU utilization countersは0%を返し、使用率の計測としては妥当性を確認できませんでした。GPU stageの差分計測にも負値があり、段階別の内訳には使っていません。測定条件とrunごとの値は[持続decodeの記録](../bench/results/2026-10-08-q2-ring-sustained/README.md)にあります。
+
+### Ring APIのGPU smoke test
+
+2026-10-10に`strata-q2_0-ring-chat.json`相当の設定で、Windows R9700のloopback APIからOpenAI chat completionを1件送りました。Expert予算は14 GiBで、Residentに6 GiB、profile GPU cacheに19,390 expertsを割り当てています。
+
+`max_tokens=64`、`reasoning_budget_tokens=8`のrequestに`OK`を返しました。idle unloadも確認しています。これはGPU生成の動作確認であり、API速度の測定ではありません。
 
 ### HIP共有Expert stream
 
@@ -114,6 +140,12 @@ Resident RAMはWindowsがページングすることがあります。起動時�
 
 `STRATA_RING_TRACE=<JSONLファイル>`を起動前に設定すると、Ringを使う非speculative decodeの診断traceを記録します。tokenごとのlatency、100-token bins、Ring/I/O統計、HIP memoryを出力します。通常利用では設定せず、MTPなどのspeculative decodingとの比較にも使わないでください。
 
-Ringの要求順、hit/miss、退避victim、解放、I/O batchを調べる場合は、`STRATA_RING_ACCESS_TRACE=<JSONLファイル>`を設定します。eventを受け取ったrelease行には、query結果と`cudaEventSynchronize`のホスト時間も記録する仕様です。`python tools/ring_release_sync_report.py <trace.jsonl>`でdecode中の同期回数、未完了event数、待ち時間を集計できます。測定中はreleaseごとにqueryを追加するため、traceの大きさに加えて処理時間も通常実行と比較できません。speculative decoding、`--serve`、Residentとのhybrid実行では使えません。生traceを公開する前にローカルパスや実行情報を確認してください。
+Ringの要求順、hit/miss、退避victim、解放、I/O batchを調べる場合は、`STRATA_RING_ACCESS_TRACE=<JSONLファイル>`を設定してください。
+
+eventを受け取ったrelease行の項目は、query結果と`cudaEventSynchronize`のホスト時間です。eventを渡さない静的cache経路では、同期状態が`-1`です。
+
+`python tools/ring_release_sync_report.py <trace.jsonl>`を実行すると、decode中の同期回数、event待ち、eventなしのrelease数を集計できます。
+
+測定中はreleaseごとにqueryを追加します。そのため、traceの大きさに加えて処理時間も通常実行と比較できません。speculative decoding、`--serve`、Residentとのhybrid実行では利用できません。生traceを公開する前にローカルパスや実行情報を確認してください。
 
 [`tools/ring_policy_sim.py`](../tools/ring_policy_sim.py)で`python tools/ring_policy_sim.py <trace.jsonl> --phase decode --capacity <slots>`を実行すると、同じ要求列をLRU、SLRU、decaying-LFU、trace-cost-weighted LFUでoffline再生できます。これはhardware-independentな診断ツールで、実行時のRing policyはLRUのままです。今回のR9700で得た2,000-token traceでは、17 GiBで全方式が710 misses、2.57 GiB相当のoffline replayではLRUより他方式のmissが増えました。別容量で実機確認した結果ではありません。集計と制限は[測定記録](../bench/results/2026-10-08-q2-ring-sustained/README.md)を参照してください。

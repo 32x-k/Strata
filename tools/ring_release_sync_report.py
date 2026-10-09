@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize timed Ring release-event waits from STRATA_RING_ACCESS_TRACE JSONL."""
+"""Summarize Ring release fences and host wait times from STRATA_RING_ACCESS_TRACE JSONL."""
 from __future__ import annotations
 
 import argparse
@@ -80,8 +80,8 @@ def summarize(path: pathlib.Path) -> dict[str, Any]:
     timed_calls = [row for row in pre_pool_events if int(row["sync_status"]) >= 0]
     timed_calls.extend(pre_pool_sync_error_rows)
 
-    if not timed_calls:
-        raise ValueError("trace contains no instrumented pre-pool Ring release synchronizations")
+    if not timed_calls and not pre_pool_events and not pre_pool_sync_error_rows:
+        raise ValueError("trace contains no pre-pool Ring release events")
 
     successful = [row for row in timed_calls if int(row["sync_status"]) == 0]
     failed = [row for row in timed_calls if int(row["sync_status"]) != 0]
@@ -101,6 +101,7 @@ def summarize(path: pathlib.Path) -> dict[str, Any]:
         "decode_dispatches_estimate": dispatches,
         "decode_release_events": len(release_rows),
         "pre_pool_release_events": len(pre_pool_events),
+        "pre_pool_release_without_event": sum(int(row["sync_status"]) < 0 for row in pre_pool_events),
         "pre_pool_sync_calls": len(timed_calls),
         "pre_pool_sync_successes": len(successful),
         "pre_pool_sync_fraction_of_dispatches": round(len(timed_calls) / dispatches, 6),
@@ -114,9 +115,10 @@ def summarize(path: pathlib.Path) -> dict[str, Any]:
         "pending_sync_wall_us": _distribution(pending_wait_us),
         "event_query_us": _distribution(query_us),
         "interpretation": (
-            "A release for layer L below the final layer is synchronized before the next layer's CPU pool call. "
-            "event_pending records cudaEventQuery immediately before cudaEventSynchronize; sync_wall_us is host "
-            "time inside cudaEventSynchronize. Token-tail releases are excluded from the pre-pool count."
+            "A pre-pool release with an event is synchronized before the next layer's CPU pool call; a row without "
+            "an event has no device fence. event_pending records cudaEventQuery immediately before "
+            "cudaEventSynchronize; sync_wall_us is host time inside cudaEventSynchronize. Rows without an event "
+            "have query_status and sync_status -1. Token-tail releases are excluded from the pre-pool count."
         ),
     }
 
