@@ -745,7 +745,7 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
     return true;
 }
 
-/// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
+/// Wall time for expert_pool_dispatch, including Ring release-event waits, source preparation, activation quantization, and pool work.
 struct Drive {
     strata::core::ExpertDispatch d;
     double cpu_ms = 0;
@@ -8788,12 +8788,11 @@ int main(int argc, char** argv) {
         // why they print "of 192" rather than "240 of 192".
         const double pool_positions = g.n_layers > 0 ? (double) drive.calls / (double) g.n_layers : 0.0;
         std::printf("%-24s %.3f ms/token over %lld layers (%.0f positions, %lld dispatches)\n",
-                    "  the CPU expert pool", pool_positions > 0.0 ? drive.cpu_ms / pool_positions : 0.0,
+                    "  expert pool dispatch", pool_positions > 0.0 ? drive.cpu_ms / pool_positions : 0.0,
                     (long long) g.n_layers, pool_positions, (long long) drive.calls);
-        // **AND WHERE INSIDE `run()` IT WENT.**  Three phases per layer and they were one number, which cannot
-        // tell a pool that is slow at the WORK from one that is slow at the SYNCHRONISATION - opposite fixes.
-        // Wait-for-park is expected to be ~0 (the workers re-parked at the end of the previous layer); the
-        // question is whether the time is in the drain or in the re-park barrier.
+        // Pool-internal phases begin after expert_pool_dispatch has completed the Ring release-event wait and
+        // source preparation. They separate pool drain from its own park barriers; they do not include the wait
+        // measured by Drive::cpu_ms above.
         if (pool_positions > 0.0) {
             double wp = 0, dr = 0, rp = 0;
             pool.phase_ms(wp, dr, rp);

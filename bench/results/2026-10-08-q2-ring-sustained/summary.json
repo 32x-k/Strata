@@ -113,7 +113,9 @@
     "interpretation": "Windows GPU utilization and process-memory counters returned zero and were not treated as valid usage measurements."
   },
   "decode_phase_diagnostics": {
-    "trace_1000_cpu_expert_pool_mean_ms_per_token": 9.54,
+    "trace_1000_expert_pool_dispatch_wall_mean_ms_per_token": 9.54,
+    "trace_1000_expert_pool_dispatch_wall_includes_ring_release_sync": true,
+    "trace_1000_expert_pool_dispatch_timing_note": "Drive.cpu_ms times the full expert_pool_dispatch callback, including Ring release-event synchronization, source preparation, activation quantization, and pool work; it is not CPU compute-only.",
     "trace_1000_host_after_ring_mean_ms_per_token": 22.98,
     "trace_1000_ring_latency_mean_ms_per_layer": 0.44,
     "ring_seen_mid_graph_fraction": 0.9588,
@@ -133,11 +135,11 @@
   "host_worker_participation_ab": {
     "regular_host_worker_combined_tok_s": 21.225,
     "regular_host_worker_runs_tok_s": [20.76, 21.43, 21.50],
-    "regular_host_worker_mean_cpu_pool_ms_per_token": 9.676,
+    "regular_host_worker_mean_expert_pool_dispatch_wall_ms_per_token": 9.676,
     "regular_host_worker_mean_host_after_ring_ms_per_token": 23.211,
     "no_host_worker_combined_tok_s": 21.170,
     "no_host_worker_runs_tok_s": [21.25, 21.23, 21.03],
-    "no_host_worker_mean_cpu_pool_ms_per_token": 10.059,
+    "no_host_worker_mean_expert_pool_dispatch_wall_ms_per_token": 10.059,
     "no_host_worker_mean_host_after_ring_ms_per_token": 23.438,
     "no_host_worker_relative_throughput_percent": -0.26,
     "outputs_match_baseline": true,
@@ -157,6 +159,7 @@
     "run_table": "runs.csv",
     "decode_latency_bins": "decode-bins.csv",
     "report": "README.md",
+    "release_sync_report": "ring-release-sync-report.json",
     "raw_files_policy": "Raw logs, telemetry, and trace JSONL remain local and are ignored by the directory .gitignore because they may contain paths or process identifiers."
   }
 }

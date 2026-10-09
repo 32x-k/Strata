@@ -1,0 +1,69 @@
+{
+  "decode_dispatches_estimate": 48000,
+  "decode_release_events": 31872,
+  "decode_tokens": 1000,
+  "event_query_us": {
+    "count": 31821,
+    "max_us": 722.0,
+    "mean_us": 0.327,
+    "p50_us": 0.3,
+    "p95_us": 0.5,
+    "p99_us": 0.7,
+    "total_us": 10418.5
+  },
+  "interpretation": "A release for layer L below the final layer is synchronized before the next layer's CPU pool call. event_pending records cudaEventQuery immediately before cudaEventSynchronize; sync_wall_us is host time inside cudaEventSynchronize. Token-tail releases are excluded from the pre-pool count.",
+  "layers": 48,
+  "limitations": [
+    "Trace and event-query instrumentation add overhead; decode throughput from this run is not a normal-use performance result.",
+    "sync_wall_us measures host time inside cudaEventSynchronize. All pre-pool events were pending before sync, so these calls waited for GPU completion; this does not quantify the decode speedup an overlap change could achieve.",
+    "Expert pool dispatch wall time includes Ring release synchronization, source preparation, activation quantization, and pool work; it is not CPU expert compute time alone."
+  ],
+  "measurement": {
+    "date": "2026-10-10",
+    "decode_tokens": 1000,
+    "decode_wall_ms": 45547.3,
+    "expert_pool_dispatch_wall_ms_per_token": 9.652,
+    "expert_ram_gib": 17,
+    "gpu": "AMD Radeon AI PRO R9700 (gfx1201)",
+    "instrumentation": "STRATA_RING_ACCESS_TRACE plus STRATA_RING_TRACE; each Ring release event queries readiness immediately before cudaEventSynchronize",
+    "model_pack": "canonical indexed Q2_0 experts.bin",
+    "output_matches_previous_access_trace_run": true,
+    "output_token_count": 1000,
+    "pool_drain_ms_per_token": 3.751,
+    "pool_workers": 7,
+    "prompt_tokens_reported": 511,
+    "r4_hit_work_done_when_pool_returned": 33583,
+    "r4_total_layer_calls": 48000,
+    "static_gpu_cache_experts": 20201
+  },
+  "pending_sync_wall_us": {
+    "count": 31821,
+    "max_us": 2832.2,
+    "mean_us": 147.603,
+    "p50_us": 136.9,
+    "p95_us": 184.6,
+    "p99_us": 322.1,
+    "total_us": 4696864.9
+  },
+  "pre_pool_event_pending_before_sync": 31821,
+  "pre_pool_event_query_errors": 0,
+  "pre_pool_event_ready_before_sync": 0,
+  "pre_pool_release_events": 31821,
+  "pre_pool_sync_calls": 31821,
+  "pre_pool_sync_errors": 0,
+  "pre_pool_sync_fraction_of_dispatches": 0.662937,
+  "pre_pool_sync_successes": 31821,
+  "schema_version": 1,
+  "sync_wall_us": {
+    "count": 31821,
+    "max_us": 2832.2,
+    "mean_us": 147.603,
+    "p50_us": 136.9,
+    "p95_us": 184.6,
+    "p99_us": 322.1,
+    "total_us": 4696864.9
+  },
+  "token_tail_release_events": 51,
+  "token_tail_sync_errors": 0,
+  "trace_version": 1
+}

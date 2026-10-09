@@ -74,7 +74,7 @@ traceあり1,000-token runを合わせると、token latencyは平均46.67 ms、
 
 1,000-token runのRing missは各580件、payloadは801.8 MB、累積I/O waitは平均541 msでした。thrashはありませんでした。I/O waitは並行処理と重なる可能性のある累積値です。decode時間からそのまま差し引けません。2,000-token runではmissが710件、payloadが981.5 MB、累積I/O waitが683 msで、こちらもthrashはありませんでした。今回の測定ではディスク待ちが主な律速要因だとは確認できませんでした。
 
-trace時のprocess working setの最大値は18,236 MiBです。空き物理RAMは一時1,329 MiBまで減りました。`--expert-ram-gb 17`はExpert slotの上限であり、process working setの上限ではありません。CPU expert poolの計測値は平均9.54 ms/token、engineの`host after ring`は22.98 ms/tokenです。一方、別経路のGPU-only graph replayは10.76 ms/tokenです。測定経路が違うため、これらを足し引きしてdecode内訳とはみなしません。
+trace時のprocess working setの最大値は18,236 MiBです。空き物理RAMは一時1,329 MiBまで減りました。`--expert-ram-gb 17`はExpert slotの上限であり、process working setの上限ではありません。`Drive::cpu_ms`で計測したexpert pool dispatchのwall timeは平均9.54 ms/tokenです。この値にはRing解放時の`cudaEventSynchronize`、source準備、activation quantization、pool処理が含まれ、CPU expert計算だけの時間ではありません。engineの`host after ring`は22.98 ms/tokenです。一方、別経路のGPU-only graph replayは10.76 ms/tokenです。測定経路が違うため、これらを足し引きしてdecode内訳とはみなしません。
 
 pool worker数を変えたtraceありrunでは、7 workersが21.43 tok/s、5 workersが21.04 tok/s、2 workersが19.94 tok/sでした。出力はいずれも7-worker baselineと一致しました。今回の範囲では7 workersが最速です。`--spec 4`は34.68 tok/sでしたが、出力はtoken 6から異なりました。出力一致が確認できていないため、この速度は採用していません。
 
@@ -114,6 +114,6 @@ Resident RAMはWindowsがページングすることがあります。起動時�
 
 `STRATA_RING_TRACE=<JSONLファイル>`を起動前に設定すると、Ringを使う非speculative decodeの診断traceを記録します。tokenごとのlatency、100-token bins、Ring/I/O統計、HIP memoryを出力します。通常利用では設定せず、MTPなどのspeculative decodingとの比較にも使わないでください。
 
-Ringの要求順、hit/miss、退避victim、解放、I/O batchを調べる場合は、`STRATA_RING_ACCESS_TRACE=<JSONLファイル>`を設定します。speculative decoding、`--serve`、Residentとのhybrid実行では使えません。traceは大きくなり、記録中の速度は通常実行と比較できません。生traceを公開する前にローカルパスや実行情報を確認してください。
+Ringの要求順、hit/miss、退避victim、解放、I/O batchを調べる場合は、`STRATA_RING_ACCESS_TRACE=<JSONLファイル>`を設定します。eventを受け取ったrelease行には、query結果と`cudaEventSynchronize`のホスト時間も記録する仕様です。`python tools/ring_release_sync_report.py <trace.jsonl>`でdecode中の同期回数、未完了event数、待ち時間を集計できます。測定中はreleaseごとにqueryを追加するため、traceの大きさに加えて処理時間も通常実行と比較できません。speculative decoding、`--serve`、Residentとのhybrid実行では使えません。生traceを公開する前にローカルパスや実行情報を確認してください。
 
 [`tools/ring_policy_sim.py`](../tools/ring_policy_sim.py)で`python tools/ring_policy_sim.py <trace.jsonl> --phase decode --capacity <slots>`を実行すると、同じ要求列をLRU、SLRU、decaying-LFU、trace-cost-weighted LFUでoffline再生できます。これはhardware-independentな診断ツールで、実行時のRing policyはLRUのままです。今回のR9700で得た2,000-token traceでは、17 GiBで全方式が710 misses、2.57 GiB相当のoffline replayではLRUより他方式のmissが増えました。別容量で実機確認した結果ではありません。集計と制限は[測定記録](../bench/results/2026-10-08-q2-ring-sustained/README.md)を参照してください。

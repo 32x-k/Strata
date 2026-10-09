@@ -250,6 +250,9 @@ void test_event_release_and_final_layer(const fs::path& dir) {
     RingExpertSource source;
     require(source.open(dir.string(), layers, experts, 2 * (uint64_t) BLOB, err),
             "could not reopen the synthetic ring: " + err);
+    const fs::path trace_path = dir / "ring-event-release.jsonl";
+    require(source.start_access_trace(trace_path.string(), err),
+            "could not start the event-release trace: " + err);
 
     const int32_t ids[] = {0, 1};
     source.begin_layer(0, ids, 2);
@@ -287,6 +290,17 @@ void test_event_release_and_final_layer(const fs::path& dir) {
 
     check_cuda(cudaEventDestroy(event), "cudaEventDestroy");
     check_cuda(cudaStreamDestroy(stream), "cudaStreamDestroy");
+    source.close();
+
+    std::ifstream input(trace_path, std::ios::binary);
+    require((bool) input, "could not read the event-release trace");
+    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    require(text.find("\"kind\":\"release\"") != std::string::npos &&
+                text.find("\"query_status\":") != std::string::npos &&
+                text.find("\"event_pending\":") != std::string::npos &&
+                text.find("\"sync_status\":0") != std::string::npos &&
+                text.find("\"sync_wall_us\":") != std::string::npos,
+            "the release trace is missing CUDA event readiness or synchronization timing");
 }
 
 }  // namespace

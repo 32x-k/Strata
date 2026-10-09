@@ -2579,7 +2579,44 @@ bool RingExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts,
 void RingExpertSource::release_layer(int64_t layer, void* after_event) {
     std::lock_guard<std::mutex> lk(mu_);
     if (layer != cur_layer_) return;
-    if (after_event != nullptr && cudaEventSynchronize((cudaEvent_t) after_event) != cudaSuccess) return;
+
+    int query_status = -1;
+    int sync_status = -1;
+    bool event_pending = false;
+    bool event_query_valid = false;
+    double query_us = 0.0;
+    double sync_wall_us = 0.0;
+    if (after_event != nullptr) {
+        // Sample readiness and host wait only for access traces; the normal path still makes one sync call.
+        if (access_trace_ != nullptr) {
+            const auto query_start = std::chrono::steady_clock::now();
+            const cudaError_t query = cudaEventQuery((cudaEvent_t) after_event);
+            query_status = (int) query;
+            query_us = std::chrono::duration<double, std::micro>(
+                           std::chrono::steady_clock::now() - query_start).count();
+            event_pending = query == cudaErrorNotReady;
+            event_query_valid = query == cudaSuccess || query == cudaErrorNotReady;
+        }
+        const auto sync_start = access_trace_ != nullptr ? std::chrono::steady_clock::now()
+                                                         : std::chrono::steady_clock::time_point{};
+        const cudaError_t sync = cudaEventSynchronize((cudaEvent_t) after_event);
+        sync_status = (int) sync;
+        if (access_trace_ != nullptr)
+            sync_wall_us = std::chrono::duration<double, std::micro>(
+                               std::chrono::steady_clock::now() - sync_start).count();
+        if (sync != cudaSuccess) {
+            if (access_trace_ != nullptr)
+                std::fprintf(access_trace_,
+                             "{\"kind\":\"release_sync_error\",\"layer\":%lld,\"query_status\":%d,"
+                             "\"event_pending\":%s,\"query_us\":%.3f,\"sync_status\":%d,"
+                             "\"sync_wall_us\":%.3f}\n",
+                             (long long) layer, query_status,
+                             event_query_valid ? (event_pending ? "true" : "false") : "null", query_us,
+                             sync_status, sync_wall_us);
+            return;
+        }
+    }
+
     for (const int64_t s : layer_slots_) {
         Slot& sl = slot_[(size_t) s];
         if (sl.held && sl.layer == layer) { sl.held = false; sl.gate = nullptr; }
@@ -2587,8 +2624,13 @@ void RingExpertSource::release_layer(int64_t layer, void* after_event) {
     layer_slots_.clear();
     held_layer_ = -1;
     if (access_trace_ != nullptr)
-        std::fprintf(access_trace_, "{\"kind\":\"release\",\"layer\":%lld,\"verifier\":false}\n",
-                     (long long) layer);
+        std::fprintf(access_trace_,
+                     "{\"kind\":\"release\",\"layer\":%lld,\"verifier\":false,"
+                     "\"query_status\":%d,\"event_pending\":%s,\"query_us\":%.3f,"
+                     "\"sync_status\":%d,\"sync_wall_us\":%.3f}\n",
+                     (long long) layer, query_status,
+                     event_query_valid ? (event_pending ? "true" : "false") : "null", query_us,
+                     sync_status, sync_wall_us);
 }
 
 bool RingExpertSource::begin_window(int64_t layer, const int32_t* ids, int64_t n) {

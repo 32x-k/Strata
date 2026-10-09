@@ -53,13 +53,15 @@ top-4の次層request-ID予測はprecision 56.6%、recall 68.4%でしたが、�
 
 ## CPU・GPU側の診断
 
-traceありの1,000-token runで、CPU expert poolは平均9.54 ms/token、engineの`host after ring`計測は平均22.98 ms/token、Ring latencyは約0.44 ms/layerでした。R9700のGPU-only graph replayは10.76 ms/tokenでしたが、これは通常decodeと異なる診断経路です。これらの値を足し引きして通常decodeの内訳とはみなしません。
+traceありの1,000-token runで、`Drive::cpu_ms`が計測したexpert pool dispatchのwall timeは平均9.54 ms/tokenでした。この値には`expert_pool_dispatch`全体の時間が入り、Ring解放時の`cudaEventSynchronize`、source準備、activation quantization、pool処理を含みます。CPU expert計算だけの時間ではありません。engineの`host after ring`計測は平均22.98 ms/token、Ring latencyは約0.44 ms/layerでした。R9700のGPU-only graph replayは10.76 ms/tokenでしたが、これは通常decodeと異なる診断経路です。これらの値を足し引きして通常decodeの内訳とはみなしません。
+
+release同期を測る診断を追加し、2026-10-10に同じ511-token promptから1,000 tokensを生成しました。48,000回のlayer dispatchのうち31,821回（66.3%）は、次層のCPU poolを呼ぶ前にrelease eventが未完了でした。`cudaEventSynchronize`のホスト時間は合計4.697秒、平均147.6 μs、p95 184.6 μs、最大2.832 msです。各回の直前に行った`cudaEventQuery`が未完了を返しており、その後の同期でGPU eventの完了を待っていました。出力1,000 tokensは以前の同一入力runとすべて一致しました。追加したqueryとtraceは通常実行にない計測負荷を加えるため、このrunの速度から同期を外した場合の改善幅は判断できません。集計は[`ring-release-sync-report.json`](ring-release-sync-report.json)にあります。
 
 GPU stageの差分計測は整合しませんでした。3-graphの合計は11.662 ms/tokenでしたが、5 stageの差分値には負値があり、合計は7.191 msでした。prefix sweepも8.996 msとなったため、stage別の内訳から結論を出していません。
 
 pool worker数を変えたtraceありrunでは、7 workersが合計21.43 tok/s、5 workersが21.04 tok/s、2 workersが19.94 tok/sでした。どの設定もbaselineと同じ出力でした。今回比較した範囲では7 workersが最速です。
 
-CPU poolの処理中にhost threadもExpertを計算する既定動作を、`--no-host-worker`で止めるA/Bを行いました。7 workersのまま3 runずつ交互に実行し、既定動作は20.76、21.43、21.50 tok/s、`--no-host-worker`は21.25、21.23、21.03 tok/sでした。合計速度はそれぞれ21.22 tok/sと21.17 tok/sで、出力はすべて一致しました。CPU pool計測は9.68 ms/tokenから10.06 ms/tokenへ、`host after ring`は23.21 ms/tokenから23.44 ms/tokenへ変化しました。差は小さく、`--no-host-worker`でもhost側の区間は短くなりませんでした。既定動作を維持します。
+CPU poolの処理中にhost threadもExpertを計算する既定動作を、`--no-host-worker`で止めるA/Bを行いました。7 workersのまま3 runずつ交互に実行し、既定動作は20.76、21.43、21.50 tok/s、`--no-host-worker`は21.25、21.23、21.03 tok/sでした。合計速度はそれぞれ21.22 tok/sと21.17 tok/sで、出力はすべて一致しました。expert pool dispatchのwall timeは9.68 ms/tokenから10.06 ms/tokenへ、`host after ring`は23.21 ms/tokenから23.44 ms/tokenへ変化しました。dispatch時間にはRing解放同期も含まれます。差は小さく、`--no-host-worker`でもhost側の区間は短くなりませんでした。既定動作を維持します。
 
 `--spec 4`の1,000-token試験は34.68 tok/sでしたが、出力はtoken 6からbaselineと異なりました。この速度は同じ出力を保つ比較ではないため採用しません。MTP-onlyの128-token試験はdraft受理が2/375（0.5%）でtoken 8から分岐し、`--no-verify-graph`の試験もtoken 6から分岐しました。
 
@@ -68,8 +70,9 @@ CPU poolの処理中にhost threadもExpertを計算する既定動作を、`--n
 今回、decode性能を上げるコード変更は評価していません。Ring I/Oは主な律速に見えず、CPU pool数の比較では7 workersが最速でした。CPU/host側の負荷は追加調査の候補ですが、GPU utilization countersとstage timingに問題があるため、内訳の断定には使っていません。次の最適化は一つずつ変更し、同じ条件で出力一致と速度を比べます。
 
 - `summary.json`は測定条件と集計値です。
+- `ring-release-sync-report.json`はrelease eventの未完了数と`cudaEventSynchronize`時間の集計です。再集計には`python tools/ring_release_sync_report.py <access-trace.jsonl>`を使います。
 - `runs.csv`はrun単位の速度、token latency、Ring I/O、RAM、出力一致を記録しています。
 - `decode-bins.csv`はtraceありbaselineの100-token区間です。worker数のA/Bは`runs.csv`に記録しています。
 - 生ログ、trace JSONL、telemetry CSVはこのフォルダーにローカル保存しています。絶対パスやprocess IDを含むファイルがあるため、Gitには含めません。
 
-`STRATA_RING_TRACE=<JSONLファイル>`はRing利用時の非speculative decode向け診断です。token latency、100-token bins、Ring/I/O統計、HIP memoryを記録します。`STRATA_RING_ACCESS_TRACE=<JSONLファイル>`はRing要求とI/O batchを記録し、non-speculative、non-serve、non-hybrid実行に限定しています。どちらも通常利用では設定しないでください。
+`STRATA_RING_TRACE=<JSONLファイル>`はRing利用時の非speculative decode向け診断です。token latency、100-token bins、Ring/I/O統計、HIP memoryを記録します。`STRATA_RING_ACCESS_TRACE=<JSONLファイル>`はRing要求、I/O batch、release eventの状態と同期時間を記録し、non-speculative、non-serve、non-hybrid実行に限定しています。同期時間を測るためreleaseごとに`cudaEventQuery`を呼ぶので、どちらのtraceも通常利用では設定しないでください。
