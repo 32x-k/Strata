@@ -257,6 +257,8 @@ struct Stager {
     // D-5: the pinned ring's depth (STRATA_STAGER_RING, default 16) - how far the host copies can run ahead of the
     // DMAs of the unpinned experts' blobs
     int kRing = 16;
+    static constexpr int kMaxBatch = 32;
+    int batch = 1;                 // only raised for sources that can merge their own file reads
     // `from` set: the blob is copied by the source itself (CS-T: a GGUF read in place assembles it from its three
     // role slices; a pointer to it would not live as long as the queue)
     struct Job { const uint8_t* src; size_t bytes; core::ExpertSource* from = nullptr; int32_t l = 0, e = 0; };
@@ -280,6 +282,7 @@ struct Stager {
 
     bool init(size_t blob_bytes, int nthreads) {
         if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
+        batch = std::clamp(batch, 1, std::min(kRing, kMaxBatch));
         buf.assign((size_t) kRing, nullptr);
         pinned.assign((size_t) kRing, 0);
         dma_done.assign((size_t) kRing, nullptr);
@@ -319,33 +322,60 @@ struct Stager {
             }
             for (;;) {
                 active.fetch_add(1, std::memory_order_acq_rel);
-                const int j = claim(seen);
+                int count = 0;
+                const int j = claim(seen, batch, count);
                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
-                const int b = j % kRing;
-                if (j >= kRing)   // job j - kRing's DMA from this buffer is queued
-                    while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
-                // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
-                // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
-                // was a ring entry the routing skipped (an event never recorded returns at once)
-                cudaEventSynchronize(dma_done[b]);
-                const Job& jb = jobs[(size_t) j];
-                if (jb.from == nullptr) std::memcpy(buf[b], jb.src, jb.bytes);
-                else if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
-                    std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e, jb.l);
-                    std::abort();
+                for (int i = j; i < j + count; ++i) {
+                    const int b = i % kRing;
+                    if (i >= kRing)   // job i - kRing's DMA from this buffer is queued
+                        while (issued.load(std::memory_order_acquire) <= i - kRing) std::this_thread::yield();
+                    // and done - for a generation's first kRing jobs that is the previous generation's last DMA
+                    cudaEventSynchronize(dma_done[b]);
                 }
-                ready[(size_t) j].store(1, std::memory_order_release);
+
+                core::ExpertSource* done[ kMaxBatch ];
+                int ndone = 0;
+                for (int i = j; i < j + count; ++i) {
+                    const Job& jb = jobs[(size_t) i];
+                    if (jb.from == nullptr) {
+                        std::memcpy(buf[i % kRing], jb.src, jb.bytes);
+                        continue;
+                    }
+                    bool seen_source = false;
+                    for (int q = 0; q < ndone; ++q) if (done[q] == jb.from) { seen_source = true; break; }
+                    if (seen_source) continue;
+                    done[ndone++] = jb.from;
+                    int32_t layers[kMaxBatch], experts[kMaxBatch];
+                    uint8_t* dst[kMaxBatch];
+                    size_t n = 0;
+                    for (int q = j; q < j + count; ++q) {
+                        const Job& x = jobs[(size_t) q];
+                        if (x.from != jb.from) continue;
+                        layers[n] = x.l; experts[n] = x.e; dst[n] = buf[q % kRing];
+                        ++n;
+                    }
+                    if (!jb.from->copy_blobs(layers, experts, dst, n)) {
+                        std::fprintf(stderr, "prefill: the expert source could not batch-copy expert %d of layer %d\n", jb.e, jb.l);
+                        std::abort();
+                    }
+                }
+                for (int i = j; i < j + count; ++i) ready[(size_t) i].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
             }
         }
     }
-    int claim(uint32_t g) {
+    int claim(uint32_t g, int want, int& count) {
         uint64_t cur = head.load(std::memory_order_acquire);
         for (;;) {
             if ((uint32_t) (cur >> 32) != g) return -1;
             const int n = (int) ((cur >> 16) & 0xffff), j = (int) (cur & 0xffff);
             if (j >= n) return -1;
-            if (head.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire)) return j;
+            const int take = std::min(std::max(1, want), n - j);
+            const uint64_t next = (cur & ~0xffffull) | (uint64_t) (j + take);
+            if (head.compare_exchange_weak(cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                count = take;
+                return j;
+            }
         }
     }
     /// A layer's jobs; the previous layer's are finished (finish()).
@@ -782,7 +812,14 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->transient(l, e);
         const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
+        m.stager->batch = 1;
+        if (src != nullptr && src->supports_batch_copy()) {
+            const char* bv = std::getenv("STRATA_STAGER_BATCH");
+            m.stager->batch = bv ? std::clamp(std::atoi(bv), 1, Stager::kMaxBatch) : 8;
+        }
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
+        else if (m.stager->batch > 1)
+            std::fprintf(stderr, "prefill: batched expert staging enabled (batch=%d)\n", m.stager->batch);
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
@@ -2644,6 +2681,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::vector<int> stage_of(order.size(), -1);
                         // the unpinned ones are copied to pinned buffers by the stager's threads, in this order
                         std::vector<int> job_of(order.size(), -1);
+                        // A fully pinned Ring can DMA directly from its slots, so there is no staging worker to
+                        // batch the reads. Reserve that layer's non-GPU experts here; RingExpertSource groups them
+                        // into bounded overlapped reads in begin_layer(). Unpinned Rings batch through the stager.
+                        if (m.src->supports_batch_copy()) {
+                            std::vector<int32_t> direct_ids;
+                            for (int32_t e : order) {
+                                if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                if (m.src->transient(l, e)) direct_ids.push_back(e);
+                            }
+                            if (!direct_ids.empty() && m.src->pinned(l, direct_ids[0]))
+                                m.src->begin_layer(l, direct_ids.data(), (int64_t) direct_ids.size());
+                        }
                         if (!stream_all) {
                             std::vector<Stager::Job> js;
                             for (size_t j = 0; j < order.size(); ++j) {

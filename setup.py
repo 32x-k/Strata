@@ -29,9 +29,9 @@ answers, no questions), --setup (install another model / change settings instead
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --build (compile instead of the ready-made
 engine), --check (only check this PC), --resident-budget-gib N (UD-Q4_K_XL's or UD-IQ4_XS's experts in RAM; with
---expert-ram-gb, the Resident share of the same bounded Q2_0 budget), --expert-ram-gb N (Windows AMD direct runner;
-writes run-<model>-ring.bat and a local run-<model>-ring-chat.bat,
-not the server config), --ring-engine DIR (the fork-built Ring engine folder; default build-hip-win), --kv-streaming on|off|auto.
+--expert-ram-gb, the Resident share of the same bounded Q2_0 budget), --expert-ram-gb N (Windows AMD Q2_0 Ring;
+writes direct, browser-chat and OpenAI/Anthropic API launchers), --ring-engine DIR (the fork-built Ring engine folder;
+default build-hip-win), --kv-streaming on|off|auto.
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
 than it recommends - a longer context, more GPUs, a bigger RAM budget, a size it thinks will not fit - is kept, with
@@ -3628,10 +3628,9 @@ def write_bounded_ring_script(model, exe, args, gpu, ram_gb, lib_dirs=(), env=No
 def write_bounded_ring_chat_script(model, exe, args, gpu, ram_gb, lib_dirs=(), env=None, port=8080):
     """Write a local browser-chat launcher for the persistent bounded Ring.
 
-    This is intentionally not the normal external-compatible server config: ``serve/ring_chat.py`` starts the local
-    browser page and adds the Ring-compatible persistent ``--serve`` loop.  The generated JSON keeps the large paths
-    out of the batch command line and lets the browser launcher share the validated direct-runner arguments.
-    ``--reload-each-turn`` remains available as an explicit one-shot diagnostic mode.
+    The generated JSON keeps the large paths out of the batch command line and lets the browser launcher share the
+    validated direct-runner arguments. ``--reload-each-turn`` remains available as an explicit one-shot diagnostic
+    mode.
     """
     if not WIN:
         raise RuntimeError("the bounded expert-RAM browser chat is currently Windows-only")
@@ -3665,6 +3664,49 @@ def write_bounded_ring_chat_script(model, exe, args, gpu, ram_gb, lib_dirs=(), e
             "echo The model and bounded Ring/Hybrid allocation stay loaded between messages.\n"
             "echo Add --reload-each-turn for the diagnostic one-shot mode.\n"
             f'"{python}" "{ROOT / "serve" / "ring_chat.py"}" --config "{cfg_path}" --port {int(port)} --open %*\n'
+            "if errorlevel 1 pause\n")
+    script.write_text(text, encoding="utf-8")
+    return script
+
+
+def write_bounded_ring_api_script(model, exe, args, gpu, ram_gb, lib_dirs=(), env=None, port=8080,
+                                 host="127.0.0.1", api_key=""):
+    """Write the OpenAI/Anthropic API config and launcher using the shared persistent Strata server."""
+    if not WIN:
+        raise RuntimeError("the bounded expert-RAM API server is currently Windows-only")
+    tag = model.lower()
+    cfg_path = ROOT / f"strata-{tag}-ring-api.json"
+    pack = ""
+    try:
+        pack = args[args.index("--pack") + 1]
+    except (ValueError, IndexError):
+        pass
+    cfg = {
+        "exe": str(exe), "args": [str(x) for x in args], "cwd": str(ROOT),
+        "tokenizer": str(Path(pack) / "tokenizer") if pack else "",
+        "model_name": f"{tag}-ring", "log": str(ROOT / f"strata-{tag}-ring-api.log"),
+        "backend": "hip", "gpu": int(gpu), "ring_ram_gb": int(ram_gb),
+        "lib_dirs": [str(x) for x in lib_dirs], "env": dict(env or {}), "port": int(port),
+        "host": str(host or "127.0.0.1"),
+    }
+    if api_key:
+        cfg["api_key"] = str(api_key)
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    script = ROOT / f"run-{tag}-ring-api.bat"
+    setup_env = ([f'set "ROCM_BIN={lib_dirs[0]}"',
+                  f'set "PATH={";".join(str(d) for d in lib_dirs)};%PATH%"'] if lib_dirs else [])
+    setup_env += [f'set "{k}={v}"' for k, v in (env or {}).items()
+                  if k not in ("STRATA_RESIDENT_PIN", "STRATA_RESIDENT_HEADROOM_GIB")]
+    python = sys.executable
+    text = ("@echo off\n"
+            f"title Strata {model} - Ring API server\n"
+            f"cd /d \"{ROOT}\"\n"
+            f"set \"HIP_VISIBLE_DEVICES={gpu}\"\n"
+            + "\n".join(setup_env) + ("\n" if setup_env else "") +
+            "echo Persistent bounded Ring server; OpenAI and Anthropic compatible.\n"
+            f"echo Listening on: {host}:{int(port)}\n"
+            "echo OpenAI path: /v1/chat/completions   Anthropic path: /v1/messages\n"
+            f'"{python}" -m serve.server --engine strata --config "{cfg_path}" --port {int(port)} %*\n'
             "if errorlevel 1 pause\n")
     script.write_text(text, encoding="utf-8")
     return script
@@ -3812,8 +3854,8 @@ def main() -> int:
                     help="normal resident mode: GiB of experts kept in RAM (default: the RAM less 24 GB; with "
                          "--expert-ram-gb, the Resident share of the same bounded Q2_0 budget)")
     ap.add_argument("--expert-ram-gb", type=int, metavar="N",
-                    help="experimental: write a Windows AMD Q2_0 direct-runner with a bounded pinned expert-RAM ring "
-                         "of N GiB; this is separate from the server config")
+                    help="experimental: write Windows AMD Q2_0 direct, browser-chat and OpenAI/Anthropic API launchers "
+                         "using a bounded pinned expert-RAM ring of N GiB")
     ap.add_argument("--ring-engine", metavar="DIR",
                     help="--expert-ram-gb: fork-built Ring engine folder (default: build-hip-win)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
@@ -4632,7 +4674,7 @@ def main() -> int:
         cfg["args"] = recommend_pool_workers(cfg["args"])
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
-    ring_script = ring_chat_script = None
+    ring_script = ring_chat_script = ring_api_script = None
     if a.expert_ram_gb is not None:
         ring_budget = a.resident_budget_gib if a.resident_budget_gib is not None else None
         ring_args = bounded_ring_args(cfg["args"], a.expert_ram_gb, ring_budget)
@@ -4641,6 +4683,9 @@ def main() -> int:
         ring_chat_script = write_bounded_ring_chat_script(tag, cfg["exe"], ring_args, gpu["index"],
                                                           a.expert_ram_gb, cfg.get("lib_dirs") or [],
                                                           cfg.get("env") or {}, port)
+        ring_api_script = write_bounded_ring_api_script(
+            tag, cfg["exe"], ring_args, gpu["index"], a.expert_ram_gb, cfg.get("lib_dirs") or [],
+            cfg.get("env") or {}, port, host=cfg.get("host") or "127.0.0.1", api_key=cfg.get("api_key") or "")
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
     if cal is None and not hip and not a.no_start and not a.yes and ask(
             "Tune Strata for this PC now? It measures a few engine settings (about 5-10 minutes; the PC is busy "
@@ -4652,12 +4697,20 @@ def main() -> int:
     if ring_script is not None:
         ok(f"direct bounded-RAM script: {ring_script.name} (--expert-ram-gb {a.expert_ram_gb}; pass --tokens on the command line)")
         ok(f"local Ring chat screen: {ring_chat_script.name} (browser UI; persistent Ring/Hybrid process)")
+        ok(f"Ring API server: {ring_api_script.name} (OpenAI and Anthropic compatible; persistent Ring/Hybrid process)")
         say()
-        say("Ring setup is ready; the normal server was not started.")
+        say("Ring setup is ready; no server was started.")
         say(f"  Direct test: {ring_script.name} --tokens \"11,353,2688,264\" --max-new 16")
         say(f"  Chat screen: {ring_chat_script.name}")
-        say("  The chat screen keeps the Ring/Hybrid process loaded between turns; pass --reload-each-turn for one-shot diagnostics.")
-        say("  The regular strata-*.json remains the normal server config; it is not changed to use Ring.")
+        say(f"  API server:  {ring_api_script.name}")
+        api_host = cfg.get("host") or "127.0.0.1"
+        say(f"  API bind:    {api_host}:{port}")
+        if api_host in ("127.0.0.1", "localhost", "::1"):
+            say(f"  API URLs:    http://127.0.0.1:{port}/v1 (OpenAI), /v1/messages (Anthropic)")
+        else:
+            say("  API paths:   /v1/chat/completions (OpenAI), /v1/messages (Anthropic); remote clients need an API key")
+        say("  Both servers keep the Ring/Hybrid process loaded between turns; use one at a time because they share the port.")
+        say("  The direct runner remains available for token-ID tests; the normal strata-*.json is unchanged.")
         return 0
 
     say()

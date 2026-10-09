@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import codecs
 import ctypes
+import ipaddress
 import json
 import os
 import queue
@@ -1494,6 +1495,59 @@ def engine_args(cfg: dict) -> list[str]:
             args += ["--vram-segment-mib", str(seg)]
     args += parallel_args(cfg, args)
     return learned_profile_args(cfg, args)
+
+
+def _is_loopback_host(host: str) -> bool:
+    value = str(host or "").strip().strip("[]").lower()
+    if value == "localhost" or value.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def bounded_ring_budget(args: list[str], cfg: dict, host: str, api_key: str) -> int | None:
+    """Validate the Ring limits for the persistent API server and return its actual expert-RAM cap, if enabled."""
+    found = [i for i, arg in enumerate(args) if arg == "--expert-ram-gb"]
+    if not found:
+        if cfg.get("ring_ram_gb") not in (None, 0):
+            raise ValueError('config has "ring_ram_gb" but engine args omit --expert-ram-gb')
+        return None
+    if len(found) != 1 or found[0] + 1 >= len(args):
+        raise ValueError("--expert-ram-gb must appear once with a whole-number GiB value")
+    try:
+        budget = int(args[found[0] + 1])
+    except (TypeError, ValueError):
+        raise ValueError("--expert-ram-gb must be a whole-number GiB value") from None
+    if budget < 0:
+        raise ValueError("--expert-ram-gb must not be negative")
+    if budget == 0:
+        if cfg.get("ring_ram_gb") not in (None, 0):
+            raise ValueError('config "ring_ram_gb" does not match --expert-ram-gb 0')
+        return None
+    if len(gpu_list(cfg)) > 1:
+        raise ValueError("bounded Ring supports one GPU; remove the multi-GPU config")
+
+    unsupported = ("--batch", "--slots", "--layer-split", "--vram-elastic")
+    if any(arg == flag or arg.startswith(flag + "=") for arg in args for flag in unsupported):
+        raise ValueError("bounded Ring does not support batching, layer splits, or a dynamic GPU cache")
+    if cfg.get("vision"):
+        raise ValueError("the bounded Ring API server is text-only; remove the vision config")
+    env = cfg.get("env") or {}
+    if not isinstance(env, dict):
+        raise ValueError('config "env" must be an object')
+    for name in ("STRATA_RING_ACCESS_TRACE",):
+        if os.environ.get(name) or env.get(name):
+            raise ValueError(f"{name} is a diagnostic for direct Ring runs and cannot be used with the "
+                             "persistent server")
+    declared = cfg.get("ring_ram_gb")
+    if declared is not None and (isinstance(declared, bool) or not isinstance(declared, (int, float)) or
+                                 declared != budget):
+        raise ValueError(f'config "ring_ram_gb" ({declared!r}) does not match --expert-ram-gb {budget}')
+    if not _is_loopback_host(host) and not (isinstance(api_key, str) and api_key.strip()):
+        raise ValueError("a non-loopback Ring API server requires an API key; use --api-key or set api_key in the config")
+    return budget
 
 
 PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT)
@@ -4002,9 +4056,16 @@ def main() -> int:
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
+    ring_budget = None
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
+        start_args = engine_args(cfg)
+        try:
+            ring_budget = bounded_ring_budget(cfg=cfg, args=start_args, host=a.host,
+                                             api_key=a.api_key or cfg.get("api_key", ""))
+        except ValueError as e:
+            ap.error(f"Ring server config: {e}")
         vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
@@ -4041,10 +4102,13 @@ def main() -> int:
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+        engine = StrataEngine(exe, start_args + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                               env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
-        warn_tight_ram(engine.info.get("arena_mib"))
+        if ring_budget is not None:
+            engine.info.update({"ring_mode": "persistent serve", "ring_ram_gb": float(ring_budget)})
+        else:
+            warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop())
         if note:                                        # #560 #516: before --open starts a browser on that card
@@ -4059,6 +4123,8 @@ def main() -> int:
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    if ring_budget is not None:
+        svc.ring_mode = True
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:

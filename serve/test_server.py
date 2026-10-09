@@ -21,8 +21,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, StrataEngine,  # noqa: E402
-                          engine_args, layer_split_value, measured_decode_rate, prompt_tokens_seen, request_timings,
-                          serve, start_failure_hint)
+                          bounded_ring_budget, engine_args, layer_split_value, measured_decode_rate,
+                          prompt_tokens_seen, request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1142,6 +1142,40 @@ class LayerSplit(unittest.TestCase):
     def test_one_gpu_ignores_it(self):
         self.assertEqual(engine_args({"args": ["--native", "x"], "gpu": [0], "layer_split": "24,16"}),
                          ["--native", "x"])
+
+
+class BoundedRingServer(unittest.TestCase):
+    def test_supported_single_gpu_persistent_config(self):
+        cfg = {"args": ["--native", "model.gguf", "--expert-ram-gb", "14"], "gpu": [0], "ring_ram_gb": 14}
+        self.assertEqual(bounded_ring_budget(engine_args(cfg), cfg, "127.0.0.1", ""), 14)
+        self.assertEqual(bounded_ring_budget(engine_args(cfg), cfg, "localhost", ""), 14)
+
+    def test_network_bind_needs_an_api_key(self):
+        args = ["--native", "model.gguf", "--expert-ram-gb", "14"]
+        with self.assertRaisesRegex(ValueError, "requires an API key"):
+            bounded_ring_budget(args, {"args": args}, "0.0.0.0", "")
+        self.assertEqual(bounded_ring_budget(args, {"args": args}, "0.0.0.0", "secret"), 14)
+
+    def test_rejects_modes_the_ring_engine_does_not_support(self):
+        cases = [
+            ({"args": ["--native", "x", "--expert-ram-gb", "14", "--batch", "2"]}, "batching"),
+            ({"args": ["--native", "x", "--expert-ram-gb", "14"], "gpu": [0, 1]}, "one GPU"),
+            ({"args": ["--native", "x", "--expert-ram-gb", "14"], "vision": {"exe": "vision.exe"}}, "text-only"),
+            ({"args": ["--native", "x", "--expert-ram-gb", "14"], "ring_ram_gb": 17}, "does not match"),
+        ]
+        for cfg, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                bounded_ring_budget(engine_args(cfg), cfg, "127.0.0.1", "")
+
+    def test_non_ring_configs_remain_unchanged(self):
+        cfg = {"args": ["--native", "model.gguf"], "ring_ram_gb": 0}
+        self.assertIsNone(bounded_ring_budget(engine_args(cfg), cfg, "0.0.0.0", ""))
+
+    def test_access_trace_is_rejected_for_the_persistent_server(self):
+        args = ["--native", "x", "--expert-ram-gb", "14"]
+        with mock.patch.dict(os.environ, {"STRATA_RING_ACCESS_TRACE": "trace.jsonl"}):
+            with self.assertRaisesRegex(ValueError, "diagnostic for direct Ring runs"):
+                bounded_ring_budget(args, {"args": args}, "127.0.0.1", "")
 
 
 class DraftHeadHint(unittest.TestCase):

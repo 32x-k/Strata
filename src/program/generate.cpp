@@ -3184,6 +3184,12 @@ int main(int argc, char** argv) {
     strata::core::ArenaExpertSource arena_src;
     strata::core::RingExpertSource ring_src;
     strata::core::ExpertSource* srcp = nullptr;
+    const char* ring_access_trace_env = std::getenv("STRATA_RING_ACCESS_TRACE");
+    if (ring_access_trace_env != nullptr && ring_access_trace_env[0] != '\0' &&
+        (o.expert_ram_gb <= 0 || hybrid_ring || o.spec > 0 || o.serve)) {
+        std::fprintf(stderr, "strata generate: STRATA_RING_ACCESS_TRACE requires a non-speculative, non-serve, non-hybrid --expert-ram-gb run\n");
+        return 2;
+    }
     if (o.expert_ram_gb > 0) {
         const uint64_t total_ram = (uint64_t) o.expert_ram_gb * 1024ull * 1024ull * 1024ull;
         ring_src.set_gguf(o.native_preset);
@@ -3218,6 +3224,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
+            if (ring_access_trace_env != nullptr && ring_access_trace_env[0] != '\0') {
+                if (!ring_src.start_access_trace(ring_access_trace_env, err)) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                    return 1;
+                }
+            }
+            std::fprintf(stderr, "strata generate: Ring file reads %s (%s)\n",
+                         ring_src.unbuffered() ? "unbuffered" : "buffered", ring_src.io_note().c_str());
             const std::string verifier_note = ring_src.verifier_slots() > 0
                 ? "; verifier tail " + std::to_string(ring_src.verifier_slots()) + " slots" : std::string();
             std::fprintf(stderr, "strata generate: expert ring: %lld slots x %lld B = %.2f GiB (--expert-ram-gb %d)%s\n",
@@ -3575,31 +3589,79 @@ int main(int argc, char** argv) {
         // #286: an unbuffered file tier reads the pairs in batches of 64, the next batch while this one is copied
         std::future<void> ahead;
         auto read_batch = [&](int64_t at) { src.prefetch_pairs(profile.data() + at, std::min<int64_t>(64, want - at)); };
-        for (int64_t i = 0; i < want; ++i) {
-            if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
-                if (ahead.valid()) ahead.get();
-                else read_batch(i);
-                if (i + 64 < want) ahead = std::async(std::launch::async, read_batch, i + 64);
+        if (srcp == &ring_src && ring_src.supports_batch_copy()) {
+            // The profile is globally ranked, but its selected prefix is fixed by `want`. Admit that same prefix
+            // first, then group only the blocking reads by layer so the bounded Ring can fill them together.
+            struct Fill { int64_t layer; int32_t expert, slot; int64_t rank; };
+            std::vector<Fill> fills;
+            fills.reserve((size_t) want);
+            for (int64_t i = 0; i < want; ++i) {
+                const auto [layer, expert] = profile[(size_t) i];
+                const int32_t slot = xcache.admit(layer, expert);
+                if (slot == strata::core::kNotResident) {
+                    if (per_layer) continue;
+                    break;
+                }
+                fills.push_back({layer, expert, slot, i});
             }
-            const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (slot == strata::core::kNotResident) {
-                if (per_layer) continue;
-                break;
+            std::stable_sort(fills.begin(), fills.end(), [](const Fill& a, const Fill& b) {
+                return a.layer < b.layer;
+            });
+            const int64_t group_cap = std::max<int64_t>(1, ring_src.normal_slots());
+            for (size_t first = 0; first < fills.size();) {
+                size_t layer_end = first + 1;
+                while (layer_end < fills.size() && fills[layer_end].layer == fills[first].layer) ++layer_end;
+                for (size_t at = first; at < layer_end;) {
+                    const size_t end = std::min<size_t>(layer_end, at + (size_t) group_cap);
+                    std::vector<int32_t> ids;
+                    ids.reserve(end - at);
+                    for (size_t q = at; q < end; ++q) ids.push_back(fills[q].expert);
+                    ring_src.begin_layer(fills[at].layer, ids.data(), (int64_t) ids.size());
+                    for (size_t q = at; q < end; ++q) {
+                        const Fill& f = fills[q];
+                        const uint8_t* b = srcp->blob(f.layer, f.expert);
+                        const bool copied = b != nullptr && xcache.fill_slot_blocking(
+                            f.slot, b, err, (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(f.layer));
+                        if (!copied) {
+                            if (b == nullptr && err.empty()) err = "the expert source could not produce a blob";
+                            std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
+                                         (long long) f.rank, err.c_str());
+                            return 1;
+                        }
+                        ++prefilled;
+                    }
+                    ring_src.release_layer(fills[at].layer, nullptr);
+                    at = end;
+                }
+                first = layer_end;
             }
-            const int64_t layer = profile[(size_t) i].first;
-            const uint8_t* b = srcp->blob(layer, profile[(size_t) i].second);
-            const bool copied = b != nullptr && xcache.fill_slot_blocking(
-                slot, b, err, (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer));
-            // Ring's profile copy is blocking, so its slot can be reused immediately before the ranked list moves
-            // to another layer.  Persistent sources keep their existing no-op release contract.
-            if (srcp->transient()) srcp->release_layer(layer, nullptr);
-            if (!copied) {
-                if (b == nullptr && err.empty()) err = "the expert source could not produce a blob";
-                std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
-                             (long long) i, err.c_str());
-                return 1;
+        } else {
+            for (int64_t i = 0; i < want; ++i) {
+                if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
+                    if (ahead.valid()) ahead.get();
+                    else read_batch(i);
+                    if (i + 64 < want) ahead = std::async(std::launch::async, read_batch, i + 64);
+                }
+                const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
+                if (slot == strata::core::kNotResident) {
+                    if (per_layer) continue;
+                    break;
+                }
+                const int64_t layer = profile[(size_t) i].first;
+                const uint8_t* b = srcp->blob(layer, profile[(size_t) i].second);
+                const bool copied = b != nullptr && xcache.fill_slot_blocking(
+                    slot, b, err, (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer));
+                // Ring's profile copy is blocking, so its slot can be reused immediately before the ranked list moves
+                // to another layer. Persistent sources keep their existing no-op release contract.
+                if (srcp->transient()) srcp->release_layer(layer, nullptr);
+                if (!copied) {
+                    if (b == nullptr && err.empty()) err = "the expert source could not produce a blob";
+                    std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
+                                 (long long) i, err.c_str());
+                    return 1;
+                }
+                ++prefilled;
             }
-            ++prefilled;
         }
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
@@ -4852,6 +4914,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: hybrid Resident/Ring Ring allocation failed: %s\n", err.c_str());
                 return 1;
             }
+            std::fprintf(stderr, "strata generate: hybrid Ring file reads %s (%s)\n",
+                         ring_src.unbuffered() ? "unbuffered" : "buffered", ring_src.io_note().c_str());
             if (keep_resident) ring_src.set_resident(&src);
             srcp = &ring_src;
             drive.d.src = srcp;
@@ -7859,9 +7923,80 @@ int main(int argc, char** argv) {
                      (long long) ps.experts_dma, ps.ms_experts_host, (long long) ps.experts_resident, ps.ms_ple);
     }
 
+    ring_src.access_trace_marker("decode_begin");
+    const char* ring_trace_env = std::getenv("STRATA_RING_TRACE");
+    std::FILE* ring_trace = nullptr;
+    strata::core::RingExpertSource::Stats trace_start{}, trace_previous{};
+    std::vector<double> trace_latencies;
+    bool trace_started = false;
+    if (ring_trace_env != nullptr && ring_trace_env[0] != '\0') {
+        if (o.expert_ram_gb <= 0 || o.spec > 0) {
+            std::fprintf(stderr, "strata generate: STRATA_RING_TRACE requires --expert-ram-gb and non-speculative decode\n");
+            return 2;
+        }
+        ring_trace = std::fopen(ring_trace_env, "wb");
+        if (ring_trace == nullptr) {
+            std::fprintf(stderr, "strata generate: cannot write Ring trace %s\n", ring_trace_env);
+            return 2;
+        }
+        (void) std::setvbuf(ring_trace, nullptr, _IOFBF, 64 * 1024);
+        const char* batch_env = std::getenv("STRATA_STAGER_BATCH");
+        const long stager_batch = batch_env != nullptr ? std::strtol(batch_env, nullptr, 10) : 8;
+        std::fprintf(ring_trace,
+                     "{\"kind\":\"meta\",\"prompt_tokens\":%zu,\"conditioning_tokens\":%zu,"
+                     "\"max_new\":%lld,\"speculation\":false,\"expert_ram_gib\":%.3f,"
+                     "\"ring_slots\":%lld,\"slot_bytes\":%lld,\"io_unbuffered\":%s,\"stager_batch\":%ld}\n",
+                     o.tokens.size(), o.tokens.size() > 0 ? o.tokens.size() - 1 : 0,
+                     (long long) o.max_new, (double) o.expert_ram_gb, (long long) ring_src.slots(),
+                     (long long) ring_src.slot_bytes(), ring_src.unbuffered() ? "true" : "false", stager_batch);
+    }
+    auto write_ring_bin = [&](size_t first, size_t last) {
+        if (ring_trace == nullptr || first == 0 || last < first || last > trace_latencies.size()) return;
+        const auto current = ring_src.stats();
+        std::vector<double> sample(trace_latencies.begin() + (ptrdiff_t) (first - 1),
+                                   trace_latencies.begin() + (ptrdiff_t) last);
+        double sum = 0.0;
+        for (double ms : sample) sum += ms;
+        std::sort(sample.begin(), sample.end());
+        auto percentile = [&](double p) {
+            const size_t i = std::min(sample.size() - 1, (size_t) std::ceil(p * (double) sample.size()) - 1);
+            return sample[i];
+        };
+        size_t gpu_free = 0, gpu_total = 0;
+        const bool gpu_mem_ok = cudaMemGetInfo(&gpu_free, &gpu_total) == cudaSuccess;
+        if (!gpu_mem_ok) (void) cudaGetLastError();
+        std::fprintf(ring_trace,
+                     "{\"kind\":\"bin\",\"first_token\":%zu,\"last_token\":%zu,\"mean_ms\":%.4f,"
+                     "\"p50_ms\":%.4f,\"p95_ms\":%.4f,\"p99_ms\":%.4f,\"max_ms\":%.4f,"
+                     "\"ring_occupied\":%lld,\"ring_slots\":%lld,\"ring_hits_delta\":%lld,"
+                     "\"ring_misses_delta\":%lld,\"ring_reads_delta\":%lld,\"ring_evictions_delta\":%lld,"
+                     "\"ring_thrash_delta\":%lld,\"payload_bytes_delta\":%llu,\"requested_bytes_delta\":%llu,"
+                     "\"io_requests_delta\":%lld,\"io_batches_delta\":%lld,\"io_ms_delta\":%.4f,"
+                     "\"io_wait_ms_delta\":%.4f,\"max_outstanding\":%lld,\"max_copy_batch\":%lld,"
+                     "\"scratch_bytes\":%zu,\"gpu_memory_valid\":%s,\"gpu_used_bytes\":%llu,"
+                     "\"gpu_total_bytes\":%llu}\n",
+                     first, last, sum / (double) sample.size(), percentile(0.50), percentile(0.95),
+                     percentile(0.99), sample.back(), (long long) current.occupied_slots, (long long) current.slots,
+                     (long long) (current.hits - trace_previous.hits),
+                     (long long) (current.misses - trace_previous.misses),
+                     (long long) (current.reads - trace_previous.reads),
+                     (long long) (current.evictions - trace_previous.evictions),
+                     (long long) (current.thrash - trace_previous.thrash),
+                     (unsigned long long) (current.payload_bytes - trace_previous.payload_bytes),
+                     (unsigned long long) (current.requested_bytes - trace_previous.requested_bytes),
+                     (long long) (current.io_requests - trace_previous.io_requests),
+                     (long long) (current.io_batches - trace_previous.io_batches), current.io_ms - trace_previous.io_ms,
+                     current.io_wait_ms - trace_previous.io_wait_ms, (long long) current.max_outstanding,
+                     (long long) current.max_copy_batch, current.scratch_bytes, gpu_mem_ok ? "true" : "false",
+                     (unsigned long long) (gpu_mem_ok ? gpu_total - gpu_free : 0),
+                     (unsigned long long) (gpu_mem_ok ? gpu_total : 0));
+        trace_previous = current;
+    };
+
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
         if (native_pack) { spec_pos = pos; break; }
+        if (pos >= n_prompt - 1) ring_src.access_trace_marker("decode_token");
         if (pos >= o.max_context) {
             std::fprintf(stderr, "strata generate: ran out of context at position %lld\n", (long long) pos);
             return 2;
@@ -7871,6 +8006,27 @@ int main(int argc, char** argv) {
         // rate, and it stopped before the NaN scan, the logits dump and the sampler.  The published tok/s
         // figure is a WALL-CLOCK rate: everything one token costs, PLE advance to sampled id.  A rate that
         // excludes real per-token work is not a rate anyone can plan against.
+        if (ring_trace != nullptr && !trace_started && pos == n_prompt - 1) {
+            trace_start = trace_previous = ring_src.stats();
+            trace_started = true;
+            size_t gpu_free = 0, gpu_total = 0;
+            const bool gpu_mem_ok = cudaMemGetInfo(&gpu_free, &gpu_total) == cudaSuccess;
+            if (!gpu_mem_ok) (void) cudaGetLastError();
+            std::fprintf(ring_trace,
+                         "{\"kind\":\"baseline\",\"ring_reads\":%lld,\"ring_hits\":%lld,"
+                         "\"ring_misses\":%lld,\"ring_evictions\":%lld,\"ring_occupied\":%lld,"
+                         "\"payload_bytes\":%llu,\"requested_bytes\":%llu,\"io_requests\":%lld,"
+                         "\"io_batches\":%lld,\"io_ms\":%.4f,\"io_wait_ms\":%.4f,"
+                         "\"gpu_memory_valid\":%s,\"gpu_used_bytes\":%llu,\"gpu_total_bytes\":%llu}\n",
+                         (long long) trace_start.reads, (long long) trace_start.hits,
+                         (long long) trace_start.misses, (long long) trace_start.evictions,
+                         (long long) trace_start.occupied_slots, (unsigned long long) trace_start.payload_bytes,
+                         (unsigned long long) trace_start.requested_bytes, (long long) trace_start.io_requests,
+                         (long long) trace_start.io_batches, trace_start.io_ms, trace_start.io_wait_ms,
+                         gpu_mem_ok ? "true" : "false",
+                         (unsigned long long) (gpu_mem_ok ? gpu_total - gpu_free : 0),
+                         (unsigned long long) (gpu_mem_ok ? gpu_total : 0));
+        }
         const Clock::time_point t0 = Clock::now();
         // **THE PLE'S TOKEN WINDOW ADVANCES HERE, ONCE PER TOKEN, AND `ple_stage_token` RUNS OUTSIDE THE
         // CAPTURE.**  Both are the driver's job: `ngram_rows` is a host hash over the last three tokens and the
@@ -8063,14 +8219,24 @@ int main(int argc, char** argv) {
         // CHARGED HERE, AFTER THE SAMPLER, so the wall-clock rate covers the whole token including the embedding,
         // the NaN scan, the logits readback and the sample (A7).  Only DECODE positions count; prefill is
         // measured separately.
-        if (pos >= n_prompt - 1) total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-        else prefill_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        const double position_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        if (pos >= n_prompt - 1) total_ms += position_ms;
+        else prefill_ms += position_ms;
         if (pos == n_prompt - 1) ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
         // **THE PREDICTION AT THE LAST PROMPT POSITION *IS* THE FIRST GENERATED TOKEN.**  Sampling on every
         // position and recording only from `n_prompt - 1` onward is what keeps the two cases from needing
         // separate handling - and the version that "obviously" only samples after the prompt loses exactly one
         // token's worth of conditioning.
-        if (pos >= n_prompt - 1) produced.push_back(next);
+        if (pos >= n_prompt - 1) {
+            produced.push_back(next);
+            if (ring_trace != nullptr) {
+                const size_t token = produced.size();
+                trace_latencies.push_back(position_ms);
+                std::fprintf(ring_trace, "{\"kind\":\"token\",\"token\":%zu,\"latency_ms\":%.4f}\n",
+                             token, position_ms);
+                if (token % 100 == 0) write_ring_bin(token - 99, token);
+            }
+        }
         if ((int64_t) produced.size() >= o.max_new) break;
         if (o.stop_eos && pos >= n_prompt - 1 &&
             std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) next) != o.eos_ids.end()) break;
@@ -8501,9 +8667,53 @@ int main(int argc, char** argv) {
     std::printf("prompt  :");
     for (int64_t t : o.tokens) std::printf(" %lld", (long long) t);
     std::printf("\noutput  :");
+    ring_src.access_trace_marker("decode_end");
     for (int64_t t : produced) std::printf(" %lld", (long long) t);
     std::printf("\n");
     const double decode_ms = decoded > 0 ? total_ms / (double) decoded : 0.0;
+    if (ring_trace != nullptr) {
+        if (!trace_latencies.empty() && trace_latencies.size() % 100 != 0)
+            write_ring_bin(trace_latencies.size() - trace_latencies.size() % 100 + 1, trace_latencies.size());
+        std::vector<double> sorted = trace_latencies;
+        std::sort(sorted.begin(), sorted.end());
+        auto percentile = [&](double p) {
+            if (sorted.empty()) return 0.0;
+            return sorted[std::min(sorted.size() - 1, (size_t) std::ceil(p * (double) sorted.size()) - 1)];
+        };
+        const auto trace_end = ring_src.stats();
+        size_t gpu_free = 0, gpu_total = 0;
+        const bool gpu_mem_ok = cudaMemGetInfo(&gpu_free, &gpu_total) == cudaSuccess;
+        if (!gpu_mem_ok) (void) cudaGetLastError();
+        std::fprintf(ring_trace,
+                     "{\"kind\":\"summary\",\"trace_tokens\":%zu,\"decoded_tokens\":%lld,"
+                     "\"decode_ms\":%.3f,\"decode_tok_s\":%.3f,\"mean_token_ms\":%.4f,"
+                     "\"p50_ms\":%.4f,\"p95_ms\":%.4f,\"p99_ms\":%.4f,\"max_ms\":%.4f,"
+                     "\"ring_reads_delta\":%lld,\"ring_hits_delta\":%lld,\"ring_misses_delta\":%lld,"
+                     "\"ring_evictions_delta\":%lld,\"ring_thrash_delta\":%lld,"
+                     "\"payload_bytes_delta\":%llu,\"requested_bytes_delta\":%llu,"
+                     "\"io_requests_delta\":%lld,\"io_batches_delta\":%lld,\"io_ms_delta\":%.4f,"
+                     "\"io_wait_ms_delta\":%.4f,\"max_outstanding\":%lld,\"scratch_bytes\":%zu,"
+                     "\"gpu_memory_valid\":%s,\"gpu_used_bytes\":%llu,\"gpu_total_bytes\":%llu}\n",
+                     trace_latencies.size(), (long long) decoded, total_ms,
+                     decode_ms > 0.0 ? 1000.0 / decode_ms : 0.0,
+                     decoded > 0 ? total_ms / (double) decoded : 0.0, percentile(0.50), percentile(0.95),
+                     percentile(0.99), sorted.empty() ? 0.0 : sorted.back(),
+                     (long long) (trace_end.reads - trace_start.reads),
+                     (long long) (trace_end.hits - trace_start.hits),
+                     (long long) (trace_end.misses - trace_start.misses),
+                     (long long) (trace_end.evictions - trace_start.evictions),
+                     (long long) (trace_end.thrash - trace_start.thrash),
+                     (unsigned long long) (trace_end.payload_bytes - trace_start.payload_bytes),
+                     (unsigned long long) (trace_end.requested_bytes - trace_start.requested_bytes),
+                     (long long) (trace_end.io_requests - trace_start.io_requests),
+                     (long long) (trace_end.io_batches - trace_start.io_batches), trace_end.io_ms - trace_start.io_ms,
+                     trace_end.io_wait_ms - trace_start.io_wait_ms, (long long) trace_end.max_outstanding,
+                     trace_end.scratch_bytes, gpu_mem_ok ? "true" : "false",
+                     (unsigned long long) (gpu_mem_ok ? gpu_total - gpu_free : 0),
+                     (unsigned long long) (gpu_mem_ok ? gpu_total : 0));
+        std::fflush(ring_trace);
+        std::fclose(ring_trace);
+    }
     std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s\n", "decode", (long long) decoded, total_ms,
                 decode_ms > 0.0 ? 1000.0 / decode_ms : 0.0);
     if (n_prompt > 1)

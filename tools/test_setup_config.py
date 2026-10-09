@@ -190,6 +190,28 @@ class BoundedRing(unittest.TestCase):
             self.assertIn("RING_TEST", text)
             self.assertIn('set "STRATA_HIPBLASLT_TUNING=C:/table.txt"', text)
 
+    def test_ring_api_script_uses_the_compatible_persistent_server(self):
+        with tempfile.TemporaryDirectory() as d, unittest.mock.patch.object(setup, "ROOT", Path(d)), \
+                unittest.mock.patch.object(setup, "WIN", True), \
+                unittest.mock.patch.object(setup.sys, "executable", "C:/Python/python.exe"):
+            script = setup.write_bounded_ring_api_script(
+                "Q2_0", "C:/strata.exe", ["--pack", "C:/pack", "--expert-ram-gb", "14",
+                                              "--resident-budget-gib", "6"], 0, 14, ["C:/hip/bin"],
+                {"STRATA_HIPBLASLT_TUNING": "C:/table.txt"}, 8080, api_key="local-secret")
+            cfg = json.loads((Path(d) / "strata-q2_0-ring-api.json").read_text(encoding="utf-8"))
+            text = script.read_text(encoding="utf-8")
+            self.assertEqual(cfg["args"][-4:], ["--expert-ram-gb", "14", "--resident-budget-gib", "6"])
+            self.assertEqual(cfg["ring_ram_gb"], 14)
+            self.assertEqual(cfg["host"], "127.0.0.1")
+            self.assertEqual(cfg["api_key"], "local-secret")
+            self.assertEqual(cfg["tokenizer"], str(Path("C:/pack") / "tokenizer"))
+            self.assertIn("serve.server --engine strata", text)
+            self.assertIn("OpenAI and Anthropic compatible", text)
+            self.assertIn("/v1/messages", text)
+            self.assertIn('set "HIP_VISIBLE_DEVICES=0"', text)
+            self.assertIn('set "ROCM_BIN=C:/hip/bin"', text)
+            self.assertIn('set "STRATA_HIPBLASLT_TUNING=C:/table.txt"', text)
+
 
 class NoBrowser(unittest.TestCase):
     """#609 (#631): --no-browser keeps the chat page from opening: "open_browser": false in the run config, no --open

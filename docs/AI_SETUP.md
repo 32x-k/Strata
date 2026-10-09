@@ -106,7 +106,7 @@ The flags (all of them: `START-HERE.bat --help`):
 | `--no-start` | install only, do not start the server |
 | `--setup` | install another model or change settings of an installed one |
 | `--check` | only check the PC |
-| `--expert-ram-gb N` | Windows AMD Q2_0 only: write a separate direct runner with an N GiB bounded expert-RAM budget; it does not start the server |
+| `--expert-ram-gb N` | Windows AMD Q2_0 only: write direct, browser-chat and OpenAI/Anthropic API launchers with an N GiB bounded expert-RAM budget; setup does not start them |
 | `--resident-budget-gib N` | with `--expert-ram-gb`, keep N GiB of that same budget in Resident RAM and give the remainder to Ring; otherwise normal model setup uses it as before |
 | `--ring-engine DIR` | the fork-built Ring engine folder for `--expert-ram-gb` (default `build-hip-win`; no public engine fallback) |
 
@@ -125,17 +125,21 @@ Notes:
   One card per model and no images on Windows for now. It is new: ask the user to report how it runs (docs/AMD_HIP.md).
 - **Windows AMD bounded ring:** `START-HERE.bat --yes --backend hip --family qwen --model Q2_0 --expert-ram-gb 17`
   uses the fork build in `build-hip-win` and writes `run-q2_0-ring.bat` after preparing the canonical indexed Q2_0 pack.
-  It also writes `run-q2_0-ring-chat.bat`, which opens the existing local browser chat and reuses the pack tokenizer and
-  chat template; it keeps one bounded Hybrid/Ring process loaded between messages and does not expose an external-compatible
-  API. Add `--reload-each-turn` to intentionally start one direct Ring process per message. Use `--ring-engine DIR` for
+  It also writes `run-q2_0-ring-chat.bat` for the local browser and `run-q2_0-ring-api.bat` for the persistent OpenAI- and
+  Anthropic-compatible server. Both reuse the pack tokenizer and chat template and keep one bounded Hybrid/Ring process
+  loaded between messages. The API base URL is `http://127.0.0.1:8080/v1`; OpenAI clients use `/chat/completions`, and
+  Anthropic clients use `/v1/messages`. The server is text-only, serves one request at a time, and refuses a non-loopback
+  bind unless an API key is set. Use either server launcher, not both at once, because they share the port.
+  Add `--reload-each-turn` to intentionally start one direct Ring process per browser message. Use `--ring-engine DIR` for
   another fork build. The generated direct runner starts the engine directly, not `serve.py`;
   pass `--tokens` to it. It pre-fills the shipped static expert profile into the GPU cache; routed cache misses stay on
   the Ring's CPU path. On the tested 32 GB PC, use 17 GiB; 14-16 GiB leaves more headroom. To share the bounded budget,
   add `--resident-budget-gib 6` to a `--expert-ram-gb 14` setup: the Resident complement and Ring slots together stay
   within 14 GiB. A failed Resident allocation falls back to a full bounded Ring rather than allocating an unbounded arena.
   This path supports only the static profile-filled GPU cache and fixed-slot speculative/MTP verifier; runtime cache
-  admission or eviction, batching, the resident engine protocol for the external API, and multiple GPUs remain unsupported.
-  The local browser launcher uses the Ring's fixed single-GPU `--serve` loop. `--no-verify-graph`
+  admission or eviction, `--batch` inference, and multiple GPUs remain unsupported. The API launcher reuses the existing
+  `serve.server` protocol layer and the Ring's fixed single-GPU `--serve` loop; it does not add a second API implementation.
+  `--no-verify-graph`
   is an opt-in slower correctness path for verifier checks; it keeps shared-expert work on the verifier stream for
   repeatable ordering.
 - **NVIDIA with no ready-made engine for the card:** setup offers to install build tools and compile (20-40 minutes);

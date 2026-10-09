@@ -182,8 +182,9 @@ RTX 5070, against ~3 tokens/s before these changes.
 
 **Bounded expert-RAM ring (engine 0.1.39, experimental):** `--expert-ram-gb N` replaces the full resident arena with a
 bounded LRU ring of pinned slots. It accepts only the canonical Q2_0 `experts.bin`; native GGUF expert assembly,
-PCIe aliases, batching, serving, layer splits and multi-GPU runs are intentionally refused. A static GPU expert cache is
-supported when `--expert-cache` and `--expert-profile` are supplied together: setup fills that fixed VRAM tier once,
+PCIe aliases, `--batch` inference, layer splits and multi-GPU runs are intentionally refused. The persistent single-GPU
+`--serve` path is supported by the OpenAI/Anthropic API server. A static GPU expert cache is supported when
+`--expert-cache` and `--expert-profile` are supplied together: setup fills that fixed VRAM tier once,
 GPU hits bypass Ring reads, and routed misses remain on the CPU. Runtime cache admission and eviction are not supported.
 With that static cache and the fixed verifier-tail reservation, speculative decoding and MTP are supported in the
 single-GPU path; `--no-verify-graph` (or `STRATA_VERIFY_NO_GRAPH=1`) runs the same verifier directly without CUDA
@@ -199,24 +200,56 @@ check fails, the Resident copy is released and the full bounded Ring is used ins
 The ring disables the captured token graph and records a CUDA/HIP event before releasing each layer's slots. This
 keeps CPU reads, host-to-device copies and GPU consumers ordered. A small ring is useful for correctness/eviction tests,
 not as a performance setting; a profile-filled GPU cache is a separate static experiment and still uses the normal
-per-layer release path. On the Radeon AI PRO R9700 (31.9 GiB, gfx1201), the same 17 GiB Ring run measured 6.77
+per-layer release path.
+
+On Windows, Ring chooses buffered or `FILE_FLAG_NO_BUFFERING` reads at startup; `STRATA_UNBUFFERED_LOAD=1` forces
+unbuffered reads and `=0` forces the file cache. With unbuffered I/O active, nearby expert ranges are merged into
+4 KiB-aligned overlapped reads. The prefill stager batches up to eight source jobs by default;
+`STRATA_STAGER_BATCH` selects 1–32, with 1 disabling stager batching. Pinned Ring layers are read in groups of at most
+32. Direct-I/O scratch memory is temporary and is not
+part of the `--expert-ram-gb` slot cap, which is not a process-wide RAM limit. The implementation references the
+[upstream Strata repository](https://github.com/Niko1221/Strata) and its [stager batching change](https://github.com/Niko1221/Strata/pull/1323),
+[unbuffered read path](https://github.com/Niko1221/Strata/pull/357) and [follow-up](https://github.com/Niko1221/Strata/pull/362).
+
+`STRATA_RING_TRACE=FILE` opts into a JSONL diagnostic trace for ordinary, non-speculative Ring decode. It records
+token latency, 100-token bins, Ring and I/O counters, and HIP memory. `STRATA_RING_ACCESS_TRACE=FILE` records Ring
+requests, hit/miss, victims, releases and I/O batches; it is rejected for speculative, serve and hybrid runs. Keep
+both unset for normal use; they are diagnostics, not performance settings.
+
+[`tools/ring_policy_sim.py`](../tools/ring_policy_sim.py) replays a request trace with LRU, SLRU,
+decaying-LFU and trace-cost-weighted LFU policies without changing runtime behavior. It is hardware-independent;
+Windows/AMD I/O settings remain in the platform-specific path and benchmark configuration. A 2,000-token R9700
+trace matched the baseline output. At 17 GiB, every replayed policy had the same 710 decode misses; at 2.57 GiB,
+the alternatives missed more than LRU. No runtime policy change or prefetch mechanism was adopted. The
+[replay results and limits](../bench/results/2026-10-08-q2-ring-sustained/README.md) describe this single trace,
+not a general workload claim.
+
+On the Radeon AI PRO R9700 (31.9 GiB, gfx1201), the same 17 GiB Ring run measured 6.77
 whole-answer decode tokens/s without the GPU tier and 18.87 tokens/s over four decode tokens with the static tier,
 seven pool workers and `int8` KV. The latter run reported 3,786/3,840 routed cache hits (98.59%). The runs used
 16 and 4 output tokens respectively, so these decode rates are a smoke measurement, not a directly comparable or
 general GPU benchmark.
 
+**Sustained Q2_0 Ring decode (2026-10-08):** on the Windows R9700 and a Ryzen AI 9 HX 370 system with 27.6 GiB RAM, a 511-token prompt was followed by 1,000-token greedy runs. The setup used a 17 GiB Ring, a static 20,201-expert GPU cache, seven pool workers, `int8` KV, unbuffered reads and stager batch 8. Three untraced runs measured 21.14, 20.48 and 19.21 tok/s (20.24 tok/s combined); a later trace-enabled set measured 21.30, 21.37 and 21.61 tok/s (21.43 tok/s combined). Outputs matched, but the 5.9% gap between groups is unexplained: temperature, power state and background load were not recorded. Do not treat it as a code speedup or as a paired trace-overhead measurement. A 2,000-token run measured 20.32 tok/s without tracing and 21.08 tok/s with tracing; their first 1,000 tokens matched.
+
+The three trace-enabled 1,000-token runs produced 46.67 ms mean token latency, with p50 46.09 ms, p95 53.52 ms and p99 58.12 ms. Each run recorded 580 Ring misses, 801.8 MB of payload, about 541 ms of cumulative I/O wait and zero thrash. Cumulative I/O wait can overlap other work. The process working set reached 18,236 MiB and free physical RAM fell to 1,329 MiB; the 17 GiB option limits Expert slots, not total process or system RAM. CPU pool time averaged 9.54 ms/token and `host after ring` 22.98 ms/token. A separate GPU-only graph replay measured 10.76 ms/token, but uses a different path and cannot be subtracted to attribute normal decode time. Windows utilization counters returned zero and were not valid; GPU-stage differencing also produced inconsistent totals.
+
+Seven pool workers were faster in this comparison than five or two, with all outputs matching. A `--spec 4` run reached 34.68 tok/s but diverged from the baseline at token 6, so it is not an output-equivalent speed result. The [run table, trace bins and diagnostic notes](../bench/results/2026-10-08-q2-ring-sustained/README.md) contain the measurements and limitations.
+
 On HIP, the shared-expert verifier side stream is opt-in: unset `STRATA_SH_STREAM` (or `=0`) keeps that work on the verifier stream; `=1` enables the fork. On the Windows R9700, a 511-token prompt followed by 128 greedy Q2_0 Ring tokens with MTP spec4 measured 50.01 tok/s with the fork off and 37.37 tok/s with it on. Both runs accepted 90 of 107 drafts in 39 rounds. With a 12-token prompt and 512 generated tokens, two runs per setting averaged 32.03 tok/s off and 26.82 tok/s on; each setting reproduced its own token stream, while the two settings differed from token 143. These are single-card measurements, not a bitwise-equivalence claim. HIP now defaults to off; set `STRATA_SH_STREAM=1` to opt back in.
 
 The R9700's hipBLASLt 1.5.0 run explicitly used `tools/hip/gfx1201-hipblaslt-100500.txt`: the engine loaded all 32 table rows, and a 511-token Q2_0 Ring prefill reported 782 launches and zero fallbacks. Two 511-token prompt runs averaged 2.292 s with the table and 2.271 s without; this is no measurable gain for this workload (the runs ranged 2.195–2.389 s with the table and 2.245–2.297 s without). With the table and `int8` KV, two prompt runs averaged 2.292 s without WMMA and 2.240 s with `STRATA_HIP_WMMA=1` (about 2.3% faster in this small A/B). A separate synthetic WMMA test at context 2048, 128 queries measured 5.240 to 0.411 ms per chunk (12.74x); the model-level prompt measurements are much smaller. WMMA remains opt-in and these runs were kept separate from token-output equality checks because its attention sum order can change output bits.
 
-On Windows AMD, `setup.py --expert-ram-gb N` writes a separate `run-q2_0-ring.bat` and uses the fork-built engine in
+On Windows AMD, `setup.py --expert-ram-gb N` writes `run-q2_0-ring.bat` and uses the fork-built engine in
 `build-hip-win` by default. Use `--ring-engine DIR` for another fork build; setup does not fall back to the public
-release engine because it may not contain the Ring implementation. It also writes `run-q2_0-ring-chat.bat`, a local
-browser chat that reuses the pack tokenizer and chat template and keeps the bounded Hybrid/Ring `--serve` process
-loaded between turns. The normal external OpenAI/Anthropic server remains separate and is not configured for Ring;
-`--reload-each-turn` on the browser launcher opts into the old one-shot diagnostic mode. The chat page keeps a compact
-status strip visible on the Chat tab: bounded Ring RAM, current system RAM, VRAM and decode speed; `Details` opens the
-full Monitor.
+release engine because it may not contain the Ring implementation. It also writes `run-q2_0-ring-chat.bat` for the
+local browser and `run-q2_0-ring-api.bat` for OpenAI- and Anthropic-compatible clients. The API launcher uses the
+existing `serve.server` protocol layer and persistent `StrataEngine`; it is text-only and processes one request at a
+time. Both launchers reuse the pack tokenizer and chat template and keep the bounded Hybrid/Ring `--serve` process
+loaded between turns. They share a port, so start only one at a time. The API binds to loopback by default and refuses
+a non-loopback bind without an API key. `--reload-each-turn` on the browser launcher opts into the one-shot diagnostic
+mode. The chat page keeps a compact status strip visible on the Chat tab: bounded Ring RAM, current system RAM, VRAM
+and decode speed; `Details` opens the full Monitor.
 
 **Resident RAM comparison on Windows AMD:** the fork already contains the upstream `FileExpertSource` resident
 complement. Without `--expert-ram-gb`, `--resident-experts` copies the experts outside the fixed GPU profile into

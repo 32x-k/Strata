@@ -618,6 +618,13 @@ bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     return true;
 }
 
+bool ExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
+    if ((n > 0) && (layers == nullptr || experts == nullptr || dst == nullptr)) return false;
+    for (size_t i = 0; i < n; ++i)
+        if (!copy_blob(layers[i], experts[i], dst[i])) return false;
+    return true;
+}
+
 // ================================ CS-T: THE GGUF SHARDS IN PLACE ================================
 //
 // A native pack without experts.bin: every file native_experts.txt names is mapped (MapViewOfFile / mmap, no
@@ -1915,7 +1922,17 @@ bool RingExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     }
     normal_slots_ = slots_ - verifier_slots_;
 
-    std::vector<uint64_t> bounds{0, (uint64_t) slots_ * (uint64_t) slot_bytes_};
+    // Probe before reserving the Ring so the available-RAM reading does not count its pages twice.
+    const uint64_t ring_bytes = (uint64_t) slots_ * (uint64_t) slot_bytes_;
+    io_note_.clear();
+#if defined(_WIN32)
+    const bool want_unbuffered = experts_unbuffered(std::vector<std::string>{path}, ring_bytes, io_note_);
+#else
+    const bool want_unbuffered = false;
+    io_note_ = "buffered (not Windows)";
+#endif
+
+    std::vector<uint64_t> bounds{0, ring_bytes};
     PinnedArena* a = new PinnedArena((uint64_t) slots_ * (uint64_t) slot_bytes_, bounds);
     if (!a->valid()) {
         delete a;
@@ -1935,6 +1952,17 @@ bool RingExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         err = "RingExpertSource: cannot open " + path + " for reading";
         return false;
     }
+    if (want_unbuffered) {
+        std::string why;
+        if (open_direct(path, why)) io_note_ += "; unbuffered reads enabled";
+        else io_note_ += "; unbuffered open failed, using buffered reads (" + why + ")";
+    } else {
+#if defined(_WIN32)
+        io_note_ += "; using buffered reads";
+#else
+        io_note_ = "buffered (not Windows)";
+#endif
+    }
     slot_.assign((size_t) slots_, Slot{});
     index_.assign((size_t) blobs_, -1);
     lru_.clear();
@@ -1951,15 +1979,34 @@ bool RingExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     held_layer_ = -1;
     n_expert_ = n_expert;
     reads_ = hits_ = misses_ = evictions_ = thrash_ = 0;
+    io_requests_ = io_batches_ = max_outstanding_ = max_copy_batch_ = 0;
+    payload_bytes_ = requested_bytes_ = 0;
+    io_ms_ = io_wait_ms_ = 0.0;
+    access_seq_ = io_batch_seq_ = 0;
+    const char* trace = std::getenv("STRATA_RING_TRACE");
+    metrics_enabled_ = trace != nullptr && trace[0] != '\0';
     path_ = path;
     return true;
 }
 
 void RingExpertSource::close() {
     std::lock_guard<std::mutex> lk(mu_);
+    if (access_trace_ != nullptr) {
+        std::fprintf(access_trace_,
+                     "{\"kind\":\"summary\",\"access_events\":%llu,\"io_batches\":%llu,"
+                     "\"reads\":%lld,\"hits\":%lld,\"misses\":%lld,\"evictions\":%lld,\"thrash\":%lld,"
+                     "\"io_ms\":%.4f,\"io_wait_ms\":%.4f}\n",
+                     (unsigned long long) access_seq_, (unsigned long long) io_batch_seq_, (long long) reads_,
+                     (long long) hits_, (long long) misses_, (long long) evictions_, (long long) thrash_,
+                     io_ms_, io_wait_ms_);
+        std::fflush(access_trace_);
+        std::fclose(access_trace_);
+        access_trace_ = nullptr;
+    }
     // Destruction is also the failure-path cleanup.  Do not free a slot arena while a late stream operation can
     // still read it; the normal path has already synchronized, so this is normally a no-op.
     if (base_ != nullptr) (void) cudaDeviceSynchronize();
+    close_direct();
     if (file_ != nullptr) { std::fclose(file_); file_ = nullptr; }
     if (arena_ != nullptr) { delete (PinnedArena*) arena_; arena_ = nullptr; }
     base_ = nullptr;
@@ -1981,15 +2028,333 @@ void RingExpertSource::close() {
     blobs_ = 0;
     n_expert_ = 0;
     path_.clear();
+    io_note_.clear();
+    direct_fallback_reported_ = false;
     resident_ = nullptr;
 }
 
-bool RingExpertSource::read_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+bool RingExpertSource::open_direct(const std::string& path, std::string& why) {
+#if defined(_WIN32)
+    const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (wide <= 0) { why = "path is not valid UTF-8"; return false; }
+    std::vector<wchar_t> w((size_t) wide, L'\0');
+    if (MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), wide) <= 0) {
+        why = "could not convert path to UTF-16";
+        return false;
+    }
+    HANDLE h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        why = "CreateFileW failed (error " + std::to_string((unsigned long long) GetLastError()) + ")";
+        return false;
+    }
+    direct_file_ = h;
+    why = "FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED";
+    return true;
+#else
+    (void) path;
+    why = "not Windows";
+    return false;
+#endif
+}
+
+void RingExpertSource::close_direct() {
+#if defined(_WIN32)
+    if (direct_file_ != nullptr) CloseHandle((HANDLE) direct_file_);
+    if (direct_buffer_ != nullptr) VirtualFree(direct_buffer_, 0, MEM_RELEASE);
+    for (void* event : direct_events_) if (event != nullptr) CloseHandle((HANDLE) event);
+#endif
+    direct_file_ = nullptr;
+    direct_buffer_ = nullptr;
+    direct_buffer_bytes_ = 0;
+    direct_events_.clear();
+}
+
+RingExpertSource::Stats RingExpertSource::stats() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    Stats s;
+    s.reads = reads_; s.hits = hits_; s.misses = misses_; s.evictions = evictions_; s.thrash = thrash_;
+    s.slots = slots_; s.max_copy_batch = max_copy_batch_;
+    for (const Slot& slot : slot_) if (slot.layer >= 0) ++s.occupied_slots;
+    s.io_requests = io_requests_; s.io_batches = io_batches_; s.max_outstanding = max_outstanding_;
+    s.payload_bytes = payload_bytes_; s.requested_bytes = requested_bytes_;
+    s.scratch_bytes = direct_buffer_bytes_; s.io_ms = io_ms_; s.io_wait_ms = io_wait_ms_;
+    s.unbuffered = direct_file_ != nullptr;
+    return s;
+}
+
+bool RingExpertSource::start_access_trace(const std::string& path, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (access_trace_ != nullptr) { err = "RingExpertSource: access trace is already open"; return false; }
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) { err = "RingExpertSource: cannot open access trace " + path; return false; }
+    (void) std::setvbuf(f, nullptr, _IOFBF, 64 * 1024);
+    access_trace_ = f;
+    metrics_enabled_ = true;
+    access_seq_ = io_batch_seq_ = 0;
+    std::fprintf(access_trace_,
+                 "{\"kind\":\"meta\",\"version\":1,\"layers\":%lld,\"experts_per_layer\":%lld,"
+                 "\"slots\":%lld,\"normal_slots\":%lld,\"verifier_slots\":%lld,\"slot_bytes\":%lld,"
+                 "\"unbuffered\":%s,\"policy\":\"lru\",\"scope\":\"Ring source requests\"}\n",
+                 (long long) (n_expert_ > 0 ? blobs_ / n_expert_ : 0), (long long) n_expert_,
+                 (long long) slots_, (long long) normal_slots_, (long long) verifier_slots_,
+                 (long long) slot_bytes_, direct_file_ != nullptr ? "true" : "false");
+    std::fprintf(access_trace_, "{\"kind\":\"initial_lru\",\"slots\":[");
+    bool first = true;
+    for (int64_t at : lru_) {
+        if (at >= normal_slots_) continue;
+        const Slot& s = slot_[(size_t) at];
+        if (!first) std::fputc(',', access_trace_);
+        first = false;
+        std::fprintf(access_trace_, "[%lld,%lld,%lld]", (long long) at, (long long) s.layer,
+                     (long long) s.expert);
+    }
+    std::fprintf(access_trace_, "]}\n");
+    return true;
+}
+
+void RingExpertSource::access_trace_marker(const char* name) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (access_trace_ != nullptr && name != nullptr)
+        std::fprintf(access_trace_, "{\"kind\":\"marker\",\"name\":\"%s\",\"seq\":%llu}\n", name,
+                     (unsigned long long) access_seq_);
+}
+
+void RingExpertSource::trace_access(int64_t layer, int64_t expert, bool hit, int64_t slot, int64_t victim_layer,
+                                    int64_t victim_expert, bool verifier) {
+    if (access_trace_ == nullptr) return;
+    std::fprintf(access_trace_,
+                 "{\"kind\":\"access\",\"seq\":%llu,\"layer\":%lld,\"expert\":%lld,"
+                 "\"hit\":%s,\"slot\":%lld,\"victim_layer\":%lld,\"victim_expert\":%lld,"
+                 "\"verifier\":%s}\n",
+                 (unsigned long long) ++access_seq_, (long long) layer, (long long) expert,
+                 hit ? "true" : "false", (long long) slot, (long long) victim_layer,
+                 (long long) victim_expert, verifier ? "true" : "false");
+}
+
+void RingExpertSource::trace_io_batch(const ReadFill* fills, size_t n, const char* mode, bool success,
+                                      double elapsed_ms) {
+    if (access_trace_ == nullptr) return;
+    std::fprintf(access_trace_, "{\"kind\":\"io_batch\",\"batch\":%llu,\"mode\":\"%s\","
+                               "\"success\":%s,\"elapsed_ms\":%.4f,\"members\":[",
+                 (unsigned long long) ++io_batch_seq_, mode, success ? "true" : "false", elapsed_ms);
+    for (size_t i = 0; i < n; ++i) {
+        if (i != 0) std::fputc(',', access_trace_);
+        std::fprintf(access_trace_, "[%lld,%lld,%zu]", (long long) fills[i].layer,
+                     (long long) fills[i].expert, fills[i].bytes);
+    }
+    std::fprintf(access_trace_, "]}\n");
+}
+
+bool RingExpertSource::read_direct_batch(const ReadFill* fills, size_t n) {
+#if defined(_WIN32)
+    if (direct_file_ == nullptr || (fills == nullptr && n != 0)) return false;
+    if (n == 0) return true;
+    constexpr uint64_t kSector = 4096, kGap = 1ull << 20, kMerge = 32ull << 20;
+    struct Window {
+        uint64_t a0, size, skip, bytes;
+        size_t req = 0;
+        uint64_t in_req = 0;
+        uint8_t* dst = nullptr;
+    };
+    struct Request { uint64_t a0, size, pos; };
+    std::vector<Window> windows;
+    windows.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const ReadFill& f = fills[i];
+        if (f.dst == nullptr || f.bytes == 0 || f.offset > UINT64_MAX - f.bytes) return false;
+        const uint64_t end = f.offset + (uint64_t) f.bytes;
+        if (end > UINT64_MAX - (kSector - 1)) return false;
+        const uint64_t a0 = f.offset / kSector * kSector;
+        const uint64_t a1 = (end + kSector - 1) / kSector * kSector;
+        windows.push_back({a0, a1 - a0, f.offset - a0, (uint64_t) f.bytes, 0, 0, f.dst});
+    }
+    std::vector<size_t> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return windows[a].a0 < windows[b].a0; });
+
+    std::vector<Request> requests;
+    requests.reserve(n);
+    uint64_t total = 0;
+    for (size_t wi : order) {
+        Window& x = windows[wi];
+        if (!requests.empty()) {
+            Request& q = requests.back();
+            const uint64_t end = q.a0 + q.size;
+            const uint64_t xend = x.a0 + x.size;
+            if (x.a0 <= end + kGap && std::max(end, xend) - q.a0 <= kMerge) {
+                if (xend > end) {
+                    total += xend - end;
+                    q.size = xend - q.a0;
+                }
+                x.req = requests.size() - 1;
+                x.in_req = x.a0 - q.a0;
+                continue;
+            }
+        }
+        if (total > UINT64_MAX - x.size) return false;
+        requests.push_back({x.a0, x.size, total});
+        x.req = requests.size() - 1;
+        x.in_req = 0;
+        total += x.size;
+    }
+    if (total == 0 || total > (uint64_t) std::numeric_limits<size_t>::max()) return false;
+    const size_t need = (size_t) total;
+    constexpr size_t kAllocGranularity = 1u << 20;
+    if (need > std::numeric_limits<size_t>::max() - (kAllocGranularity - 1)) return false;
+    const size_t capacity = (need + kAllocGranularity - 1) / kAllocGranularity * kAllocGranularity;
+    if (capacity > direct_buffer_bytes_) {
+        if (direct_buffer_ != nullptr) VirtualFree(direct_buffer_, 0, MEM_RELEASE);
+        direct_buffer_ = VirtualAlloc(nullptr, capacity, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        direct_buffer_bytes_ = direct_buffer_ != nullptr ? capacity : 0;
+        if (direct_buffer_ == nullptr) return false;
+    }
+    while (direct_events_.size() < requests.size()) {
+        HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (event == nullptr) return false;
+        direct_events_.push_back(event);
+    }
+
+    std::vector<OVERLAPPED> overlapped(requests.size());
+    std::vector<DWORD> received(requests.size(), 0);
+    size_t issued = 0;
+    bool ok = true;
+    const auto io_start = metrics_enabled_ ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+    for (size_t q = 0; q < requests.size(); ++q) {
+        OVERLAPPED& ov = overlapped[q];
+        std::memset(&ov, 0, sizeof(ov));
+        ov.Offset = (DWORD) requests[q].a0;
+        ov.OffsetHigh = (DWORD) (requests[q].a0 >> 32);
+        ov.hEvent = (HANDLE) direct_events_[q];
+        if (!ResetEvent(ov.hEvent)) { ok = false; break; }
+        const BOOL started = ReadFile((HANDLE) direct_file_, (uint8_t*) direct_buffer_ + requests[q].pos,
+                                      (DWORD) requests[q].size, nullptr, &ov);
+        if (!started && GetLastError() != ERROR_IO_PENDING) { ok = false; break; }
+        ++issued;
+    }
+    const auto wait_start = metrics_enabled_ ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
+    for (size_t q = 0; q < issued; ++q)
+        if (!GetOverlappedResult((HANDLE) direct_file_, &overlapped[q], &received[q], TRUE)) ok = false;
+    const auto wait_end = metrics_enabled_ ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+    if (metrics_enabled_ && issued > 0) {
+        uint64_t submitted = 0;
+        for (size_t q = 0; q < issued; ++q) submitted += requests[q].size;
+        ++io_batches_;
+        io_requests_ += (int64_t) issued;
+        requested_bytes_ += submitted;
+        max_outstanding_ = std::max<int64_t>(max_outstanding_, (int64_t) issued);
+        io_ms_ += std::chrono::duration<double, std::milli>(wait_end - io_start).count();
+        io_wait_ms_ += std::chrono::duration<double, std::milli>(wait_end - wait_start).count();
+    }
+    if (!ok || issued != requests.size()) return false;
+
+    for (const Window& w : windows) {
+        if ((uint64_t) received[w.req] < w.in_req + w.skip + w.bytes) return false;
+        std::memcpy(w.dst, (const uint8_t*) direct_buffer_ + requests[w.req].pos + w.in_req + w.skip,
+                    (size_t) w.bytes);
+    }
+    if (metrics_enabled_)
+        for (size_t i = 0; i < n; ++i) payload_bytes_ += fills[i].bytes;
+    return true;
+#else
+    (void) fills; (void) n;
+    return false;
+#endif
+}
+
+bool RingExpertSource::read_blob_buffered(int64_t layer, int64_t expert, uint8_t* dst) {
     if (file_ == nullptr || dst == nullptr) return false;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const size_t bytes = (size_t) lay.blob_bytes(layer);
+    const auto io_start = metrics_enabled_ ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
     if (STRATA_FSEEK64(file_, (int64_t) lay.blob_offset(layer, expert)) != 0) return false;
-    return std::fread(dst, 1, bytes, file_) == bytes;
+    const size_t got = std::fread(dst, 1, bytes, file_);
+    if (metrics_enabled_) {
+        const double elapsed = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - io_start).count();
+        ++io_batches_; ++io_requests_; max_outstanding_ = std::max<int64_t>(max_outstanding_, 1);
+        requested_bytes_ += got; payload_bytes_ += got; io_ms_ += elapsed; io_wait_ms_ += elapsed;
+    }
+    return got == bytes;
+}
+
+bool RingExpertSource::read_batch_fills(const ReadFill* fills, size_t n) {
+    if (fills == nullptr && n != 0) return false;
+    if (n == 0) return true;
+    if (direct_file_ != nullptr) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = read_direct_batch(fills, n);
+        trace_io_batch(fills, n, "win32-overlapped", ok,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        if (ok) {
+            reads_ += (int64_t) n;
+            return true;
+        }
+        if (!direct_fallback_reported_) {
+            std::fprintf(stderr, "strata generate: Ring unbuffered batch failed; falling back to buffered reads\n");
+            direct_fallback_reported_ = true;
+        }
+        io_note_ += "; unbuffered batch failed; using buffered reads";
+        close_direct();
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    bool ok = true;
+    for (size_t i = 0; i < n; ++i) {
+        const ReadFill& f = fills[i];
+        if (f.slot < 0 || f.slot >= slots_) { ok = false; break; }
+        const Slot& s = slot_[(size_t) f.slot];
+        if (!read_blob_buffered(s.layer, s.expert, f.dst)) { ok = false; break; }
+    }
+    trace_io_batch(fills, n, direct_fallback_reported_ ? "buffered-fallback" : "buffered", ok,
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    if (!ok) return false;
+    reads_ += (int64_t) n;
+    return true;
+}
+
+void RingExpertSource::abandon_batch_fills(const ReadFill* fills, size_t n) {
+    if (fills == nullptr) return;
+    for (size_t i = 0; i < n; ++i) {
+        const int64_t at = fills[i].slot;
+        if (at < 0 || at >= normal_slots_) continue;
+        Slot& s = slot_[(size_t) at];
+        const int64_t key = s.layer * n_expert_ + s.expert;
+        if (key >= 0 && key < blobs_ && index_[(size_t) key] == at) index_[(size_t) key] = -1;
+        s.layer = s.expert = -1;
+        s.held = false;
+        s.gate = nullptr;
+        layer_slots_.erase(std::remove(layer_slots_.begin(), layer_slots_.end(), at), layer_slots_.end());
+    }
+    if (layer_slots_.empty()) held_layer_ = -1;
+}
+
+bool RingExpertSource::read_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const ReadFill fill{lay.blob_offset(layer, expert), (size_t) lay.blob_bytes(layer), dst, -1, layer, expert};
+    bool fallback = false;
+    if (direct_file_ != nullptr) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = read_direct_batch(&fill, 1);
+        trace_io_batch(&fill, 1, "win32-overlapped", ok,
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        if (ok) return true;
+        fallback = true;
+        if (!direct_fallback_reported_) {
+            std::fprintf(stderr, "strata generate: Ring unbuffered read failed; falling back to buffered reads\n");
+            direct_fallback_reported_ = true;
+        }
+        io_note_ += "; unbuffered read failed; using buffered reads";
+        close_direct();
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = read_blob_buffered(layer, expert, dst);
+    trace_io_batch(&fill, 1, fallback ? "buffered-fallback" : "buffered", ok,
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return ok;
 }
 
 bool RingExpertSource::gate_done(const void* gate) {
@@ -2021,7 +2386,9 @@ int64_t RingExpertSource::reusable_verifier_slot() {
     return best;
 }
 
-int64_t RingExpertSource::acquire_unlocked(int64_t layer, int64_t expert) {
+int64_t RingExpertSource::acquire_unlocked(int64_t layer, int64_t expert, bool defer_read, bool* needs_read) {
+    if (needs_read != nullptr) *needs_read = false;
+    if (defer_read && needs_read == nullptr) return -1;
     if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_ ||
         layer >= blobs_ / n_expert_) return -1;
     const int64_t key = layer * n_expert_ + expert;
@@ -2043,6 +2410,7 @@ int64_t RingExpertSource::acquire_unlocked(int64_t layer, int64_t expert) {
         s.held = true;
         lru_.splice(lru_.end(), lru_, s.lru);
         layer_slots_.push_back(hit);
+        trace_access(layer, expert, true, hit, -1, -1, false);
         return hit;
     }
 
@@ -2054,16 +2422,25 @@ int64_t RingExpertSource::acquire_unlocked(int64_t layer, int64_t expert) {
         // that sync: a ring smaller than one layer's working set must fail rather than overwrite a live blob.
         if (cudaDeviceSynchronize() != cudaSuccess) return -1;
         s = reusable_slot();
-        if (s < 0) return -1;
+        if (s < 0) {
+            trace_access(layer, expert, false, -1, -1, -1, false);
+            return -1;
+        }
     }
     Slot& v = slot_[(size_t) s];
+    const int64_t victim_layer = v.layer, victim_expert = v.expert;
     if (v.layer >= 0) {
         const int64_t old = v.layer * n_expert_ + v.expert;
         if (old >= 0 && old < blobs_ && index_[(size_t) old] == s) index_[(size_t) old] = -1;
         ++evictions_;
     }
-    if (!read_blob(layer, expert, base_ + (uint64_t) s * (uint64_t) slot_bytes_)) return -1;
-    ++reads_;
+    if (!defer_read) {
+        if (!read_blob(layer, expert, base_ + (uint64_t) s * (uint64_t) slot_bytes_)) {
+            trace_access(layer, expert, false, -1, victim_layer, victim_expert, false);
+            return -1;
+        }
+        ++reads_;
+    }
     v.layer = layer;
     v.expert = expert;
     v.held = true;
@@ -2071,6 +2448,8 @@ int64_t RingExpertSource::acquire_unlocked(int64_t layer, int64_t expert) {
     index_[(size_t) key] = s;
     lru_.splice(lru_.end(), lru_, v.lru);
     layer_slots_.push_back(s);
+    if (needs_read != nullptr) *needs_read = defer_read;
+    trace_access(layer, expert, false, s, victim_layer, victim_expert, false);
     return s;
 }
 
@@ -2095,6 +2474,7 @@ int64_t RingExpertSource::acquire_verifier_unlocked(int64_t layer, int64_t exper
             verifier_layer_slots_.push_back(hit);
         }
         s.verifier_age = ++verifier_age_;
+        trace_access(layer, expert, true, hit, -1, -1, true);
         return hit;
     }
 
@@ -2102,15 +2482,20 @@ int64_t RingExpertSource::acquire_verifier_unlocked(int64_t layer, int64_t exper
     const int64_t s = reusable_verifier_slot();
     if (s < 0) {
         ++thrash_;
+        trace_access(layer, expert, false, -1, -1, -1, true);
         return -1;
     }
     Slot& v = slot_[(size_t) s];
+    const int64_t victim_layer = v.layer, victim_expert = v.expert;
     if (v.layer >= 0) {
         const int64_t old = v.layer * n_expert_ + v.expert;
         if (old >= 0 && old < blobs_ && index_[(size_t) old] == s) index_[(size_t) old] = -1;
         ++evictions_;
     }
-    if (!read_blob(layer, expert, base_ + (uint64_t) s * (uint64_t) slot_bytes_)) return -1;
+    if (!read_blob(layer, expert, base_ + (uint64_t) s * (uint64_t) slot_bytes_)) {
+        trace_access(layer, expert, false, -1, victim_layer, victim_expert, true);
+        return -1;
+    }
     ++reads_;
     v.layer = layer;
     v.expert = expert;
@@ -2120,6 +2505,7 @@ int64_t RingExpertSource::acquire_verifier_unlocked(int64_t layer, int64_t exper
     v.gate = nullptr;
     index_[(size_t) key] = s;
     verifier_layer_slots_.push_back(s);
+    trace_access(layer, expert, false, s, victim_layer, victim_expert, true);
     return s;
 }
 
@@ -2140,6 +2526,56 @@ bool RingExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     return true;
 }
 
+bool RingExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
+    if (n == 0) return true;
+    if (layers == nullptr || experts == nullptr || dst == nullptr) return false;
+    if (n == 1) return copy_blob(layers[0], experts[0], dst[0]);
+    for (size_t i = 0; i < n; ++i)
+        if (dst[i] == nullptr || layers[i] != layers[0]) return ExpertSource::copy_blobs(layers, experts, dst, n);
+
+    std::unique_lock<std::mutex> lk(mu_);
+    if (direct_file_ == nullptr || verifier_active_) {
+        lk.unlock();
+        return ExpertSource::copy_blobs(layers, experts, dst, n);
+    }
+
+    if (metrics_enabled_) max_copy_batch_ = std::max<int64_t>(max_copy_batch_, (int64_t) n);
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    std::vector<int64_t> slots(n, -1);
+    std::vector<ReadFill> fills;
+    fills.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (resident_ != nullptr && resident_->has_resident(layers[i], experts[i])) {
+            if (!resident_->copy_blob(layers[i], experts[i], dst[i])) {
+                abandon_batch_fills(fills.data(), fills.size());
+                return false;
+            }
+            continue;
+        }
+        bool needs_read = false;
+        const int64_t s = acquire_unlocked(layers[i], experts[i], true, &needs_read);
+        if (s < 0) {
+            abandon_batch_fills(fills.data(), fills.size());
+            return false;
+        }
+        slots[i] = s;
+        if (needs_read) {
+            fills.push_back({lay.blob_offset(layers[i], experts[i]), (size_t) lay.blob_bytes(layers[i]),
+                             base_ + (uint64_t) s * (uint64_t) slot_bytes_, s, layers[i], experts[i]});
+        }
+    }
+
+    if (!read_batch_fills(fills.data(), fills.size())) {
+        abandon_batch_fills(fills.data(), fills.size());
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i)
+        if (slots[i] >= 0)
+            std::memcpy(dst[i], base_ + (uint64_t) slots[i] * (uint64_t) slot_bytes_,
+                        (size_t) lay.blob_bytes(layers[i]));
+    return true;
+}
+
 void RingExpertSource::release_layer(int64_t layer, void* after_event) {
     std::lock_guard<std::mutex> lk(mu_);
     if (layer != cur_layer_) return;
@@ -2150,6 +2586,9 @@ void RingExpertSource::release_layer(int64_t layer, void* after_event) {
     }
     layer_slots_.clear();
     held_layer_ = -1;
+    if (access_trace_ != nullptr)
+        std::fprintf(access_trace_, "{\"kind\":\"release\",\"layer\":%lld,\"verifier\":false}\n",
+                     (long long) layer);
 }
 
 bool RingExpertSource::begin_window(int64_t layer, const int32_t* ids, int64_t n) {
@@ -2211,6 +2650,9 @@ void RingExpertSource::release_window(int64_t layer) {
             }
             layer_slots_.clear();
             held_layer_ = -1;
+            if (access_trace_ != nullptr)
+                std::fprintf(access_trace_, "{\"kind\":\"release\",\"layer\":%lld,\"verifier\":false}\n",
+                             (long long) layer);
         }
         return;
     }
@@ -2229,6 +2671,9 @@ void RingExpertSource::release_window(int64_t layer) {
     verifier_layer_slots_.clear();
     verifier_cur_layer_ = -1;
     verifier_active_ = false;
+    if (access_trace_ != nullptr)
+        std::fprintf(access_trace_, "{\"kind\":\"release\",\"layer\":%lld,\"verifier\":true}\n",
+                     (long long) layer);
 }
 
 const uint8_t* RingExpertSource::blob(int64_t layer, int64_t expert) {
@@ -2258,6 +2703,31 @@ bool RingExpertSource::transient(int64_t layer, int64_t expert) const {
 void RingExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
     if (ids == nullptr) return;
     std::lock_guard<std::mutex> lk(mu_);
+    if (direct_file_ != nullptr && !verifier_active_) {
+        constexpr int kBatch = 32;
+        for (int64_t first = 0; first < k; first += kBatch) {
+            std::vector<ReadFill> fills;
+            fills.reserve(kBatch);
+            const int64_t end = std::min<int64_t>(k, first + kBatch);
+            for (int64_t i = first; i < end; ++i) {
+                const int32_t e = ids[i];
+                if (e < 0 || e >= n_expert_ || (resident_ != nullptr && resident_->has_resident(layer, e))) continue;
+                bool needs_read = false;
+                const int64_t s = acquire_unlocked(layer, e, true, &needs_read);
+                if (s >= 0 && needs_read) {
+                    const auto& lay = strata::kernels::cpu::expert_layout();
+                    fills.push_back({lay.blob_offset(layer, e), (size_t) lay.blob_bytes(layer),
+                                     base_ + (uint64_t) s * (uint64_t) slot_bytes_, s, layer, e});
+                }
+            }
+            if (!read_batch_fills(fills.data(), fills.size())) {
+                abandon_batch_fills(fills.data(), fills.size());
+                std::fprintf(stderr, "strata generate: Ring expert layer batch read failed for layer %lld\n",
+                             (long long) layer);
+            }
+        }
+        return;
+    }
     for (int64_t i = 0; i < k; ++i)
         if (ids[i] >= 0 && ids[i] < n_expert_ &&
             (resident_ == nullptr || !resident_->has_resident(layer, ids[i])))

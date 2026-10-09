@@ -1,0 +1,162 @@
+{
+  "date": "2026-10-08",
+  "device": {
+    "os": "Windows",
+    "cpu": "AMD Ryzen AI 9 HX 370",
+    "cpu_cores": 12,
+    "logical_processors": 24,
+    "physical_ram_gib": 27.6,
+    "gpu": "AMD Radeon AI PRO R9700",
+    "gpu_arch": "gfx1201",
+    "hip_memory_observed_gib": 31.287,
+    "hip_memory_total_gib": 31.859
+  },
+  "model_and_workload": {
+    "model_format": "canonical indexed Q2_0 experts.bin",
+    "prompt_tokens_reported_by_engine": 511,
+    "prompt_token_ids_supplied": 512,
+    "decode_sampling": "greedy",
+    "expert_ram_gib": 17,
+    "ring_slots": 13204,
+    "ring_slot_bytes": 1382400,
+    "static_gpu_cache_experts": 20201,
+    "expert_cache": "auto",
+    "prefill": "auto",
+    "kv_cache": "int8",
+    "pool_workers": 7,
+    "unbuffered_load": true,
+    "stager_batch": 8,
+    "file_cache_flushed": false,
+    "run_order": "sequential",
+    "wmma": false,
+    "speculative_decoding": false
+  },
+  "untraced_baseline": {
+    "decode_1000_tokens_tok_s": [21.14, 20.48, 19.21],
+    "decode_1000_tokens_combined_tok_s": 20.242,
+    "decode_1000_tokens_times_ms": [47313.2, 48835.1, 52055.9],
+    "decode_2000_tokens_tok_s": 20.32,
+    "decode_2000_tokens_time_ms": 98435.1,
+    "all_1000_token_outputs_identical": true,
+    "2000_token_output_prefix_matches_1000_token_output": true
+  },
+  "trace_instrumented_repeat": {
+    "decode_1000_tokens_tok_s": [21.304, 21.368, 21.613],
+    "decode_1000_tokens_combined_tok_s": 21.428,
+    "decode_1000_tokens_count": 3000,
+    "token_latency_mean_ms": 46.6684,
+    "token_latency_p50_ms": 46.0861,
+    "token_latency_p95_ms": 53.5241,
+    "token_latency_p99_ms": 58.1174,
+    "token_latency_max_ms": 74.9669,
+    "prefill_mean_ms": 2044.6,
+    "prefill_mean_tok_s": 249.93,
+    "time_to_first_token_mean_ms": 2172.1,
+    "decode_2000_tokens_tok_s": 21.08,
+    "decode_2000_tokens_time_ms": 94874.9,
+    "decode_2000_tokens_mean_latency_ms": 47.4375,
+    "decode_2000_tokens_p50_ms": 46.9159,
+    "decode_2000_tokens_p95_ms": 54.3407,
+    "decode_2000_tokens_p99_ms": 58.4382,
+    "decode_2000_tokens_max_ms": 76.0232,
+    "decode_2000_first_1000_mean_latency_ms": 46.8384,
+    "decode_2000_second_1000_mean_latency_ms": 48.0366,
+    "decode_2000_output_prefix_matches_1000_token_output": true
+  },
+  "between_group_variation": {
+    "trace_repeat_vs_untraced_1000_combined_difference_percent": 5.86,
+    "interpretation": "The same settings produced different group averages. Temperature, power state, and background load were not recorded; this is not evidence of a code speedup or trace overhead."
+  },
+  "ring_decode_io": {
+    "trace_1000_each_run": {
+      "reads": 580,
+      "misses": 580,
+      "hits": 179332,
+      "evictions": 580,
+      "thrash": 0,
+      "payload_bytes": 801792000,
+      "requested_bytes": 802975744,
+      "io_requests": 579,
+      "io_batches": 536,
+      "mean_cumulative_io_ms": 597.3,
+      "mean_cumulative_io_wait_ms": 541.0,
+      "maximum_outstanding_reads": 32,
+      "scratch_bytes": 45088768,
+      "maximum_copy_batch": 8
+    },
+    "trace_2000": {
+      "reads": 710,
+      "misses": 710,
+      "hits": 404418,
+      "evictions": 710,
+      "thrash": 0,
+      "payload_bytes": 981504000,
+      "requested_bytes": 982953984,
+      "io_requests": 709,
+      "io_batches": 664,
+      "cumulative_io_ms": 756.9,
+      "cumulative_io_wait_ms": 683.2,
+      "first_1000_misses": 580,
+      "second_1000_misses": 130
+    },
+    "interpretation": "Cumulative I/O timers can overlap concurrent work and are not an additive decode-time decomposition."
+  },
+  "memory_and_telemetry": {
+    "trace_1000_min_available_ram_mib": 1329,
+    "trace_1000_max_process_working_set_mib": 18236.2,
+    "trace_1000_mean_process_cpu_percent_normalized_to_24_logical_processors": 20.73,
+    "trace_1000_max_process_cpu_percent_normalized_to_24_logical_processors": 34.51,
+    "trace_1000_max_system_cpu_percent": 49.4,
+    "windows_gpu_utilization_counters_valid": false,
+    "windows_gpu_utilization_counters_observed_percent": 0,
+    "hip_memory_source": "cudaMemGetInfo",
+    "interpretation": "Windows GPU utilization and process-memory counters returned zero and were not treated as valid usage measurements."
+  },
+  "decode_phase_diagnostics": {
+    "trace_1000_cpu_expert_pool_mean_ms_per_token": 9.54,
+    "trace_1000_host_after_ring_mean_ms_per_token": 22.98,
+    "trace_1000_ring_latency_mean_ms_per_layer": 0.44,
+    "ring_seen_mid_graph_fraction": 0.9588,
+    "gpu_cache_hits_fraction": 0.8126,
+    "r4_hit_work_done_when_cpu_pool_returned_fraction": 0.6923,
+    "gpu_only_graph_replay_ms_per_token": 10.76,
+    "gpu_only_replay_is_comparable_to_normal_decode": false,
+    "gpu_stage_breakdown_valid": false,
+    "gpu_stage_breakdown_note": "Three-graph total was 11.662 ms/token; five-stage differencing included negative values and summed to 7.191 ms; prefix sweep was 8.996 ms."
+  },
+  "worker_count_comparison": {
+    "7_workers_combined_tok_s": 21.428,
+    "5_workers_combined_tok_s": 21.045,
+    "2_workers_combined_tok_s": 19.936,
+    "all_outputs_match_7_worker_baseline": true
+  },
+  "host_worker_participation_ab": {
+    "regular_host_worker_combined_tok_s": 21.225,
+    "regular_host_worker_runs_tok_s": [20.76, 21.43, 21.50],
+    "regular_host_worker_mean_cpu_pool_ms_per_token": 9.676,
+    "regular_host_worker_mean_host_after_ring_ms_per_token": 23.211,
+    "no_host_worker_combined_tok_s": 21.170,
+    "no_host_worker_runs_tok_s": [21.25, 21.23, 21.03],
+    "no_host_worker_mean_cpu_pool_ms_per_token": 10.059,
+    "no_host_worker_mean_host_after_ring_ms_per_token": 23.438,
+    "no_host_worker_relative_throughput_percent": -0.26,
+    "outputs_match_baseline": true,
+    "decision": "Keep the default host-worker behavior. The no-host variant was marginally slower and did not reduce the host-after-ring interval."
+  },
+  "speculation_trials_not_adopted": {
+    "spec4_1000_tok_s": 34.68,
+    "spec4_first_output_mismatch_token": 6,
+    "spec4_drafts_accepted": 647,
+    "spec4_drafts_offered": 932,
+    "mtp_only_128_drafts_accepted": 2,
+    "mtp_only_128_drafts_offered": 375,
+    "mtp_only_128_first_output_mismatch_token": 8,
+    "no_verify_graph_128_first_output_mismatch_token": 6
+  },
+  "artifacts": {
+    "run_table": "runs.csv",
+    "decode_latency_bins": "decode-bins.csv",
+    "report": "README.md",
+    "raw_files_policy": "Raw logs, telemetry, and trace JSONL remain local and are ignored by the directory .gitignore because they may contain paths or process identifiers."
+  }
+}

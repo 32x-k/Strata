@@ -177,6 +177,10 @@ public:
     /// The blob's bytes into `dst` (blob_bytes(layer) of them).  Safe from several threads for a source whose
     /// `transient` can be true.
     virtual bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst);
+    /// Copy several transient blobs into `dst` in one source-specific batch. The default calls copy_blob in order.
+    virtual bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n);
+    /// Whether the prefill stager should group this source's jobs for copy_blobs.
+    virtual bool supports_batch_copy() const { return false; }
     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
@@ -702,11 +706,18 @@ public:
     int64_t normal_slots() const { return normal_slots_; }
     int64_t verifier_slots() const { return verifier_slots_; }
     void close();
+    /// Optional diagnostics: record Ring access and I/O batch events for offline cache-policy replay.
+    bool start_access_trace(const std::string& path, std::string& err);
+    void access_trace_marker(const char* name);
 
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
+    bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
+    bool supports_batch_copy() const override { return direct_file_ != nullptr; }
+    bool unbuffered() const { return direct_file_ != nullptr; }
+    const std::string& io_note() const { return io_note_; }
     int64_t reads() const override { return reads_ + (resident_ != nullptr ? resident_->ram_reads() : 0); }
     bool pinned(int64_t layer, int64_t expert) const override;
     /// Direct PCIe aliases are intentionally disabled in the bounded-RAM port.  `slot_device` remains available for
@@ -733,6 +744,16 @@ public:
     int64_t misses() const { return misses_; }
     int64_t evictions() const { return evictions_; }
     int64_t thrash() const { return thrash_; }
+    struct Stats {
+        int64_t reads = 0, hits = 0, misses = 0, evictions = 0, thrash = 0;
+        int64_t occupied_slots = 0, slots = 0, max_copy_batch = 0;
+        int64_t io_requests = 0, io_batches = 0, max_outstanding = 0;
+        uint64_t payload_bytes = 0, requested_bytes = 0;
+        size_t scratch_bytes = 0;
+        double io_ms = 0.0, io_wait_ms = 0.0;
+        bool unbuffered = false;
+    };
+    Stats stats() const;
 
 private:
     struct Slot {
@@ -743,8 +764,18 @@ private:
         void* gate = nullptr;
         std::list<int64_t>::iterator lru{};
     };
+    struct ReadFill { uint64_t offset; size_t bytes; uint8_t* dst; int64_t slot, layer, expert; };
     bool read_blob(int64_t layer, int64_t expert, uint8_t* dst);
-    int64_t acquire_unlocked(int64_t layer, int64_t expert);
+    bool read_blob_buffered(int64_t layer, int64_t expert, uint8_t* dst);
+    void trace_access(int64_t layer, int64_t expert, bool hit, int64_t slot, int64_t victim_layer,
+                      int64_t victim_expert, bool verifier);
+    void trace_io_batch(const ReadFill* fills, size_t n, const char* mode, bool success, double elapsed_ms);
+    bool read_direct_batch(const ReadFill* fills, size_t n);
+    bool read_batch_fills(const ReadFill* fills, size_t n);
+    void abandon_batch_fills(const ReadFill* fills, size_t n);
+    bool open_direct(const std::string& path, std::string& why);
+    void close_direct();
+    int64_t acquire_unlocked(int64_t layer, int64_t expert, bool defer_read = false, bool* needs_read = nullptr);
     int64_t acquire_verifier_unlocked(int64_t layer, int64_t expert);
     int64_t reusable_slot();
     int64_t reusable_verifier_slot();
@@ -771,8 +802,19 @@ private:
     int64_t n_expert_ = 0;
     int64_t held_layer_ = -1;
     int64_t reads_ = 0, hits_ = 0, misses_ = 0, evictions_ = 0, thrash_ = 0;
-    std::string gguf_, path_;
+    int64_t io_requests_ = 0, io_batches_ = 0, max_outstanding_ = 0, max_copy_batch_ = 0;
+    uint64_t payload_bytes_ = 0, requested_bytes_ = 0;
+    double io_ms_ = 0.0, io_wait_ms_ = 0.0;
+    bool metrics_enabled_ = false;
+    std::FILE* access_trace_ = nullptr;
+    uint64_t access_seq_ = 0, io_batch_seq_ = 0;
+    std::string gguf_, path_, io_note_;
     std::FILE* file_ = nullptr;
+    void* direct_file_ = nullptr;           ///< Windows FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED handle
+    void* direct_buffer_ = nullptr;         ///< sector-aligned scratch, reused under mu_ for merged batches
+    size_t direct_buffer_bytes_ = 0;
+    std::vector<void*> direct_events_;      ///< reusable manual-reset events for overlapped reads
+    bool direct_fallback_reported_ = false;
     FileExpertSource* resident_ = nullptr;  ///< non-owning bounded resident complement, when hybrid mode is enabled
     mutable std::mutex mu_;
 };

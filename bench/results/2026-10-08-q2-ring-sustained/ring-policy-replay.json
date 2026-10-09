@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "measurement": {
+    "gpu": "AMD Radeon AI PRO R9700 (gfx1201)",
+    "model_quantization": "Q2_0",
+    "prompt_tokens": 511,
+    "generated_tokens": 2000,
+    "runtime_output_matches_baseline": true,
+    "ring_slots": 13204,
+    "slot_bytes": 1382400,
+    "ring_capacity_gib": 17.0
+  },
+  "trace_calibration": {
+    "all_phase_accesses": 446825,
+    "all_phase_hits": 424851,
+    "all_phase_misses": 21974,
+    "decode_accesses": 405128,
+    "decode_hits": 404418,
+    "decode_misses": 710,
+    "decode_misses_tokens_1_1000": 580,
+    "decode_misses_tokens_1001_2000": 130,
+    "decode_thrash": 0,
+    "lru_replay_matches_cpp_summary": true
+  },
+  "decode_policy_replay": [
+    {
+      "capacity_slots": 13204,
+      "capacity_gib": 17.0,
+      "lru_misses": 710,
+      "slru_misses": 710,
+      "decaying_lfu_misses": 710,
+      "cost_aware_lfu_misses": 710
+    },
+    {
+      "capacity_slots": 5000,
+      "capacity_gib": 6.4373,
+      "lru_misses": 710,
+      "slru_misses": 710,
+      "decaying_lfu_misses": 710,
+      "cost_aware_lfu_misses": 713
+    },
+    {
+      "capacity_slots": 2000,
+      "capacity_gib": 2.5749,
+      "lru_misses": 710,
+      "slru_misses": 760,
+      "decaying_lfu_misses": 1104,
+      "cost_aware_lfu_misses": 1191
+    }
+  ],
+  "next_layer_transition_probe": {
+    "top_k": 4,
+    "predicted_request_id_precision": 0.5661,
+    "predicted_request_id_recall": 0.6839,
+    "predicted_experts": 221885,
+    "predicted_actual_ring_misses": 0,
+    "measured_io_overlap_or_latency_saved": false
+  },
+  "limitations": [
+    "Policy results are offline replays of one 2000-token request trace, not live runs at the smaller capacities.",
+    "The request sequence and generated output were recorded with the existing LRU Ring; the replay does not demonstrate policy-specific end-to-end speed or output behavior.",
+    "Cost-aware LFU uses per-expert I/O costs measured from the full trace, so it is not an online policy or a perfect oracle.",
+    "The transition probe predicts Ring request IDs only. It does not establish that a predicted expert misses the Ring early enough to prefetch, or that any I/O wait is hidden.",
+    "The raw access trace and runtime logs remain local and are excluded from Git."
+  ]
+}

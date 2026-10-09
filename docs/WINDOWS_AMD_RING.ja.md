@@ -16,10 +16,10 @@ Ringでは通常のtoken graphを無効にします。MTPのspeculative decoding
 
 - GGUFからのExpert組み立てと、標準Q2_0以外のExpert形式
 - 実行中のGPUキャッシュ追加・追い出し
-- batch、PCIe経由のExpert処理、複数GPU、layer split
-- Ringを使った通常の外部OpenAI互換・Anthropic互換サーバー
+- `--batch`推論、PCIe経由のExpert処理、複数GPU、layer split
+- このセットアップ経路での画像入力
 
-ローカルブラウザーチャットは別経路です。`strata --serve`を固定プロファイルと単一GPUの条件で起動し、モデルとRAM領域を会話の間も保持します。
+OpenAI互換・Anthropic互換APIには、既存の`serve.server`と`StrataEngine`を使います。固定プロファイル、単一GPUの`strata --serve`プロセスを会話の間も保持します。API serverはテキスト入力専用で、リクエストを一件ずつ処理します。
 
 ## RAMの上限
 
@@ -37,11 +37,21 @@ Strataフォルダーで次のコマンドを実行してください。
 START-HERE.bat --yes --backend hip --family qwen --model Q2_0 --expert-ram-gb 17
 ```
 
-セットアップはフォーク版エンジンを`build-hip-win`から選び、`run-q2_0-ring.bat`と`run-q2_0-ring-chat.bat`を作ります。公開版エンジンにRing実装がない場合でも、自動で切り替えることはありません。別のビルドを使う場合は`--ring-engine DIR`を指定します。
+セットアップはフォーク版エンジンを`build-hip-win`から選び、`run-q2_0-ring.bat`、`run-q2_0-ring-chat.bat`、`run-q2_0-ring-api.bat`を作ります。公開版エンジンにRing実装がない場合でも、自動で切り替えることはありません。別のビルドを使う場合は`--ring-engine DIR`を指定します。
 
 通常のRing起動スクリプトはエンジンを直接起動し、`--tokens`で入力を受け取ります。静的ExpertプロファイルをGPUキャッシュへ読み込むため、GPUにあるExpertはRingから読みません。
 
-ブラウザーチャットは`run-q2_0-ring-chat.bat`から起動します。こちらはモデルとHybrid/Ringの領域をターン間で保持します。初期状態では再読み込みしません。1回のリクエストごとにモデルを再起動する診断モードは、`--reload-each-turn`で選べます。このローカル画面は外部向けの互換APIではありません。
+ブラウザーチャットは`run-q2_0-ring-chat.bat`から、外部アプリ向けAPIは`run-q2_0-ring-api.bat`から起動します。どちらもモデルとHybrid/Ringの領域をターン間で保持します。APIのOpenAI base URLは`http://127.0.0.1:8080/v1`、Anthropic endpointは`http://127.0.0.1:8080/v1/messages`です。OpenAI互換の`/v1/chat/completions`とAnthropic互換の`/v1/messages`を利用できます。両方同時に起動するとポートが競合するため、片方だけを使ってください。
+
+初期設定は`127.0.0.1`だけで待ち受けます。ほかのPCから接続する場合は、API設定JSONの`host`を変更し、`api_key`を設定するか、`STRATA_API_KEY`をセットしてください。API serverは、API keyなしでloopback以外にbindしようとすると起動を拒否します。`--reload-each-turn`はブラウザーチャットだけの診断モードで、1回のリクエストごとにモデルを再起動します。
+
+## ファイル読み込み
+
+Windowsでは、RAMリングに入らないExpertを`experts.bin`から読み込みます。起動時に選ぶ方式はOSのファイルキャッシュか、`FILE_FLAG_NO_BUFFERING`経由の読み込みです。`STRATA_UNBUFFERED_LOAD=1`は非バッファードI/O、`=0`はファイルキャッシュ経由を指定します。直接読み込みに失敗した場合は、バッファード読み込みへ切り替えます。
+
+非バッファード経路では、近接したExpertを4 KiB境界に合わせたoverlapped `ReadFile`でまとめて読み込む方式です。ページ固定できないRingではプリフィルのstagerを使います。既定のbatchは8件です。`STRATA_STAGER_BATCH=1`で一括化を無効にし、2〜32件のbatchも指定できます。ページ固定できるRingでは、レイヤーごとに最大32件をまとめて読み込みます。一時読み込みバッファーは`--expert-ram-gb`のExpert slot予算外です。したがって、PC全体やプロセス全体のRAM使用量は制限しません。
+
+実装時に参照した本家リポジトリは[Niko1221/Strata](https://github.com/Niko1221/Strata)です。関連する読み込み変更は[PR #1323](https://github.com/Niko1221/Strata/pull/1323)、[PR #357](https://github.com/Niko1221/Strata/pull/357)、[PR #362](https://github.com/Niko1221/Strata/pull/362)にあります。ここで記載したRing向けの一括読み込みは、このブランチの実装です。
 
 ## R9700での測定
 
@@ -53,6 +63,22 @@ START-HERE.bat --yes --backend hip --family qwen --model Q2_0 --expert-ram-gb 17
 | 17 GiB Ring、静的GPUキャッシュあり、7 pool workers、`int8` KV | 4生成トークンで18.87 tok/s。ルーティングされたExpertの3,786/3,840件がGPUキャッシュにありました |
 
 この2つは生成長が違うため、速度を直接比較できるベンチマークではありません。
+
+### Q2_0の持続decode
+
+2026-10-08にR9700で511-token promptの後に1,000 tokensを生成しました。CPUはRyzen AI 9 HX 370、物理RAMは27.6 GiBです。17 GiB Ring、static GPU cache 20,201 experts、7 pool workers、`int8` KV、非バッファードI/O、stager batch 8を使いました。入力には512個のtoken IDを渡し、エンジンはpromptを511 tokensと報告しています。ファイルキャッシュは消去せず、runを逐次実行しました。
+
+traceを無効にした3 runは21.14、20.48、19.21 tok/sで、合計decode時間から計算した速度は20.24 tok/sでした。traceを有効にした別の3 runは21.30、21.37、21.61 tok/s、合計で21.43 tok/sでした。6 runの出力はすべて一致しましたが、測定群の間に約5.9%の速度差が残りました。温度や電源状態、バックグラウンド負荷を記録していないため、これをコード変更やtraceの影響とは判断していません。2,000-token runはtraceなしで20.32 tok/s、traceありで21.08 tok/sでした。両方とも先頭1,000 tokensは一致しました。
+
+traceあり1,000-token runを合わせると、token latencyは平均46.67 ms、p50 46.09 ms、p95 53.52 ms、p99 58.12 msでした。traceあり2,000-token runでは、最初の1,000 tokensが平均46.84 ms、次の1,000 tokensが48.04 msでした。後半は約2.6%遅くなりました。
+
+1,000-token runのRing missは各580件、payloadは801.8 MB、累積I/O waitは平均541 msでした。thrashはありませんでした。I/O waitは並行処理と重なる可能性のある累積値です。decode時間からそのまま差し引けません。2,000-token runではmissが710件、payloadが981.5 MB、累積I/O waitが683 msで、こちらもthrashはありませんでした。今回の測定ではディスク待ちが主な律速要因だとは確認できませんでした。
+
+trace時のprocess working setの最大値は18,236 MiBです。空き物理RAMは一時1,329 MiBまで減りました。`--expert-ram-gb 17`はExpert slotの上限であり、process working setの上限ではありません。CPU expert poolの計測値は平均9.54 ms/token、engineの`host after ring`は22.98 ms/tokenです。一方、別経路のGPU-only graph replayは10.76 ms/tokenです。測定経路が違うため、これらを足し引きしてdecode内訳とはみなしません。
+
+pool worker数を変えたtraceありrunでは、7 workersが21.43 tok/s、5 workersが21.04 tok/s、2 workersが19.94 tok/sでした。出力はいずれも7-worker baselineと一致しました。今回の範囲では7 workersが最速です。`--spec 4`は34.68 tok/sでしたが、出力はtoken 6から異なりました。出力一致が確認できていないため、この速度は採用していません。
+
+WindowsのGPU utilization countersは0%を返し、使用率の計測としては妥当性を確認できませんでした。GPU stageの差分計測にも負値があり、段階別の内訳には使っていません。測定条件とrunごとの値は[持続decodeの記録](../bench/results/2026-10-08-q2-ring-sustained/README.md)にあります。
 
 ### HIP共有Expert stream
 
@@ -85,3 +111,9 @@ Resident RAMはWindowsがページングすることがあります。起動時�
 ## ログと診断
 
 `--stats`を付けると、Ring slotのhit、miss、eviction、thrashなどを確認できます。Verifier Graphを使わない経路は、結果と処理順を確かめる診断用です。通常の経路より遅いため、速度の比較には使わないでください。
+
+`STRATA_RING_TRACE=<JSONLファイル>`を起動前に設定すると、Ringを使う非speculative decodeの診断traceを記録します。tokenごとのlatency、100-token bins、Ring/I/O統計、HIP memoryを出力します。通常利用では設定せず、MTPなどのspeculative decodingとの比較にも使わないでください。
+
+Ringの要求順、hit/miss、退避victim、解放、I/O batchを調べる場合は、`STRATA_RING_ACCESS_TRACE=<JSONLファイル>`を設定します。speculative decoding、`--serve`、Residentとのhybrid実行では使えません。traceは大きくなり、記録中の速度は通常実行と比較できません。生traceを公開する前にローカルパスや実行情報を確認してください。
+
+[`tools/ring_policy_sim.py`](../tools/ring_policy_sim.py)で`python tools/ring_policy_sim.py <trace.jsonl> --phase decode --capacity <slots>`を実行すると、同じ要求列をLRU、SLRU、decaying-LFU、trace-cost-weighted LFUでoffline再生できます。これはhardware-independentな診断ツールで、実行時のRing policyはLRUのままです。今回のR9700で得た2,000-token traceでは、17 GiBで全方式が710 misses、2.57 GiB相当のoffline replayではLRUより他方式のmissが増えました。別容量で実機確認した結果ではありません。集計と制限は[測定記録](../bench/results/2026-10-08-q2-ring-sustained/README.md)を参照してください。

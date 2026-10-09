@@ -90,7 +90,7 @@ Linux:    ./setup.sh --yes --family qwen --model IQ2_XS --no-start
 | `--no-start` | インストールだけを行い、サーバーは起動しません |
 | `--setup` | 別のモデルを追加するか、インストール済みモデルの設定を変更します |
 | `--check` | PCの確認だけを行います |
-| `--expert-ram-gb N` | Windows AMDのQ2_0限定です。Expert用RAMの上限をN GiBにした個別の起動スクリプトを作ります。サーバーは起動しません |
+| `--expert-ram-gb N` | Windows AMDのQ2_0限定です。Expert用RAMをN GiBに制限する、直接実行・ブラウザーチャット・OpenAI/Anthropic APIサーバーの起動スクリプトを作ります。セットアップ中は起動しません |
 | `--resident-budget-gib N` | `--expert-ram-gb`と一緒に使うと、同じ予算のうちN GiBをResident RAMに割り当て、残りをRingに使います。それ以外では通常のモデルセットアップに使います |
 | `--ring-engine DIR` | `--expert-ram-gb`で使う、フォーク版エンジンのフォルダーです。初期値は`build-hip-win`です。公開版エンジンへは切り替えません |
 
@@ -105,19 +105,19 @@ AIエージェントには`--no-start`を推奨します。サーバーはウィ
 
 この試験機能は、このフォークに追加したものです。upstreamの公開版には含まれていない場合があります。
 
-次のコマンドは、インデックス付き標準Q2_0パックを準備し、`build-hip-win`にあるフォーク版エンジンから`run-q2_0-ring.bat`を作ります。
+次のコマンドは、インデックス付き標準Q2_0パックを準備し、`build-hip-win`にあるフォーク版エンジンから`run-q2_0-ring.bat`、`run-q2_0-ring-chat.bat`、`run-q2_0-ring-api.bat`を作ります。
 
 ```bat
 START-HERE.bat --yes --backend hip --family qwen --model Q2_0 --expert-ram-gb 17
 ```
 
-チャット用の起動スクリプト名は`run-q2_0-ring-chat.bat`です。これはパックのTokenizerとチャットテンプレートを使い、Hybrid/Ringのプロセスをメッセージ間も保持します。外部向けの互換APIは公開しません。各メッセージでRingを起動し直す場合は`--reload-each-turn`を追加してください。別のフォーク版エンジンには`--ring-engine DIR`を指定します。
+ブラウザー用は`run-q2_0-ring-chat.bat`、API用は`run-q2_0-ring-api.bat`から起動します。どちらもパックのTokenizerとチャットテンプレートを使い、Hybrid/Ringのプロセスをメッセージ間も保持します。APIは既存の互換サーバーを使い、OpenAIの`/v1/chat/completions`とAnthropicの`/v1/messages`を提供します。初期設定は`127.0.0.1`だけで待ち受け、テキスト入力を1件ずつ処理します。2つのサーバーは同じポートを使うため、片方だけを起動してください。PC外から接続するにはAPI keyが必要です。各ブラウザーメッセージでRingを起動し直す場合は`--reload-each-turn`を追加してください。別のフォーク版エンジンには`--ring-engine DIR`を指定します。
 
 通常の起動スクリプトはエンジンを直接起動します。入力には`--tokens`を指定してください。静的ExpertプロファイルをGPUキャッシュに読み込み、キャッシュにないExpertはRingのCPU経路で処理します。
 
 実機の32 GB PCでは17 GiBを使いました。14〜16 GiBにすると、RAMとWindowsのcommitに余裕ができます。ResidentとRingで予算を分けるには、`--expert-ram-gb 14`に`--resident-budget-gib 6`を追加します。合計が14 GiB以内になる設定です。Residentの確保に失敗すると、その分を解放して全量をRingに割り当てます。
 
-この経路が対応するのは、静的プロファイルで埋めるGPUキャッシュと固定スロットのspeculative/MTP verifierです。実行中のキャッシュ追加・追い出し、batch、外部API向けのResidentエンジンプロトコル、複数GPUは未対応です。Verifier確認には`--no-verify-graph`を使います。処理が遅くなり、共有Expertをverifier stream上で処理して順序を安定させます。詳しくは[Windows AMD Ringの説明](WINDOWS_AMD_RING.ja.md)を参照してください。
+この経路が対応するのは、静的プロファイルで埋めるGPUキャッシュと固定スロットのspeculative/MTP verifierです。実行中のキャッシュ追加・追い出し、batch、複数GPUは未対応です。Verifier確認には`--no-verify-graph`を使います。処理が遅くなり、共有Expertをverifier stream上で処理して順序を安定させます。詳しくは[Windows AMD Ringの説明](WINDOWS_AMD_RING.ja.md)を参照してください。
 - **カード向けのビルド済みエンジンがないNVIDIA：** セットアップはビルドツールを入れてコンパイルするか確認します。20〜40分かかります。`--yes`を指定すると実行します。
 
 ## 5. ダウンロード中にユーザーへ伝えること

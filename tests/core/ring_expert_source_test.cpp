@@ -159,6 +159,90 @@ void test_fixed_verifier_reservation(const fs::path& dir) {
     compatibility.release_window(0);
 }
 
+void test_batch_copy(const fs::path& dir) {
+    using strata::core::RingExpertSource;
+#if defined(_WIN32)
+    const char* previous = std::getenv("STRATA_UNBUFFERED_LOAD");
+    const bool had_previous = previous != nullptr;
+    const std::string saved = previous != nullptr ? previous : "";
+    require(_putenv_s("STRATA_UNBUFFERED_LOAD", "1") == 0, "could not force the Windows unbuffered test path");
+#endif
+    constexpr int64_t layers = 2, experts = 3;
+    std::string err;
+    RingExpertSource source;
+    require(source.open(dir.string(), layers, experts, 4 * (uint64_t) BLOB, err),
+            "could not open the batch-copy ring: " + err);
+#if defined(_WIN32)
+    if (had_previous) _putenv_s("STRATA_UNBUFFERED_LOAD", saved.c_str());
+    else _putenv_s("STRATA_UNBUFFERED_LOAD", "");
+    require(source.unbuffered(), "the forced Windows direct-I/O handle was not opened");
+#endif
+
+    const int32_t batch_layers[] = {0, 0, 0, 0};
+    const int32_t batch_experts[] = {0, 1, 2, 1};
+    std::vector<std::vector<uint8_t>> storage(4, std::vector<uint8_t>(BLOB));
+    uint8_t* destinations[] = {storage[0].data(), storage[1].data(), storage[2].data(), storage[3].data()};
+    require(source.copy_blobs(batch_layers, batch_experts, destinations, 4), "copy_blobs failed");
+#if defined(_WIN32)
+    require(source.unbuffered(), "copy_blobs fell back from unbuffered I/O");
+#endif
+    for (int i = 0; i < 4; ++i) {
+        const uint8_t marker = (uint8_t) (0x20 + batch_experts[i]);
+        require(storage[(size_t) i][0] == marker && storage[(size_t) i][BLOB - 1] == (uint8_t) (marker ^ 0xa5),
+                "copy_blobs returned wrong bytes");
+    }
+    require(source.reads() == 3 && source.hits() == 1, "copy_blobs did not deduplicate the repeated expert");
+    source.release_layer(0, nullptr);
+
+    const int32_t prefetched[] = {0, 2};
+    source.begin_layer(1, prefetched, 2);
+#if defined(_WIN32)
+    require(source.unbuffered(), "begin_layer fell back from unbuffered I/O");
+#endif
+    check_blob(source, 1, 0, 0x23, "batched begin_layer expert 0");
+    check_blob(source, 1, 2, 0x25, "batched begin_layer expert 2");
+    require(source.reads() == 5, "begin_layer did not load the two experts exactly once");
+    source.release_layer(1, nullptr);
+}
+
+void test_access_trace(const fs::path& dir) {
+    using strata::core::RingExpertSource;
+    constexpr int64_t layers = 2, experts = 3;
+    std::string err;
+    RingExpertSource source;
+    require(source.open(dir.string(), layers, experts, 2 * (uint64_t) BLOB, err),
+            "could not open the access-trace ring: " + err);
+    const fs::path trace_path = dir / "ring-access.jsonl";
+    require(source.start_access_trace(trace_path.string(), err), "could not start the access trace: " + err);
+
+    const int32_t ids[] = {0, 1};
+    source.begin_layer(0, ids, 2);
+    check_blob(source, 0, 0, 0x20, "traced layer 0 expert 0");
+    source.release_layer(0, nullptr);
+    source.access_trace_marker("decode_begin");
+    const int32_t next[] = {2};
+    source.begin_layer(1, next, 1);
+    check_blob(source, 1, 2, 0x25, "traced layer 1 expert 2");
+    source.release_layer(1, nullptr);
+    source.access_trace_marker("decode_end");
+    source.close();
+
+    std::ifstream input(trace_path, std::ios::binary);
+    require((bool) input, "could not read the access trace");
+    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    require(text.find("\"kind\":\"meta\"") != std::string::npos &&
+                text.find("\"kind\":\"initial_lru\"") != std::string::npos,
+            "the access trace is missing its metadata or initial cache state");
+    require(text.find("\"kind\":\"access\"") != std::string::npos &&
+                text.find("\"kind\":\"io_batch\"") != std::string::npos &&
+                text.find("\"kind\":\"release\"") != std::string::npos,
+            "the access trace is missing access, I/O, or release events");
+    require(text.find("\"name\":\"decode_begin\"") != std::string::npos &&
+                text.find("\"name\":\"decode_end\"") != std::string::npos &&
+                text.find("\"kind\":\"summary\"") != std::string::npos,
+            "the access trace is missing phase markers or its summary");
+}
+
 void test_event_release_and_final_layer(const fs::path& dir) {
     using strata::core::RingExpertSource;
     constexpr int64_t layers = 2, experts = 3;
@@ -217,6 +301,8 @@ int main() {
         create_pack(dir.path, layers, experts);
         test_lru_and_same_layer_overflow(dir.path);
         test_fixed_verifier_reservation(dir.path);
+        test_batch_copy(dir.path);
+        test_access_trace(dir.path);
         test_event_release_and_final_layer(dir.path);
         std::puts("ring_expert_source_test: PASS");
         return 0;
