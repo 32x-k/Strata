@@ -261,8 +261,11 @@ a non-loopback bind without an API key. `--reload-each-turn` on the browser laun
 mode. A Windows R9700 smoke test used the Q2_0 hybrid Ring API config (14 GiB expert budget, 6 GiB Resident budget,
 19,390 static GPU-cache experts) and returned `OK` for an OpenAI chat request with a 64-token limit and an 8-token
 reasoning budget. The test bound to `127.0.0.1` and confirmed idle unload; it verifies GPU-backed API generation, not
-API throughput. The chat page keeps a compact status strip visible on the Chat tab: bounded Ring RAM, current system
-RAM, VRAM and decode speed; `Details` opens the full Monitor.
+API throughput. The separate [Maxritz/Strata-rocm repository](https://github.com/Maxritz/Strata-rocm), reviewed at
+[commit 2ed00de](https://github.com/Maxritz/Strata-rocm/commit/2ed00de), was also consulted for the AMD serving/API path. This branch uses its existing `serve.server` and `StrataEngine`; the Ring release-fence
+bypass and per-buffer completion events described above are this branch's implementation, not a port from that repo.
+The chat page keeps a compact status strip visible on the Chat tab: bounded Ring RAM, current system RAM, VRAM and
+decode speed; `Details` opens the full Monitor.
 
 **Resident RAM comparison on Windows AMD:** the fork already contains the upstream `FileExpertSource` resident
 complement. Without `--expert-ram-gb`, `--resident-experts` copies the experts outside the fixed GPU profile into

@@ -106,6 +106,8 @@ WindowsのGPU utilization countersは0%を返し、使用率の計測として�
 
 `max_tokens=64`、`reasoning_budget_tokens=8`のrequestに`OK`を返しました。idle unloadも確認しています。これはGPU生成の動作確認であり、API速度の測定ではありません。
 
+AMD/ROCmのserve・API経路を検討する際は、別リポジトリの[Maxritz/Strata-rocm](https://github.com/Maxritz/Strata-rocm)も参照しました。参照時のcommitは[2ed00de](https://github.com/Maxritz/Strata-rocm/commit/2ed00de)です。このブランチでは既存の`serve.server`と`StrataEngine`を使っています。Ring解放待ちの回避とbuffer別eventは、このブランチで実装した変更です。
+
 ### HIP共有Expert stream
 
 HIPでは共有Expertのverifier side streamを初期状態で無効にしました。`STRATA_SH_STREAM=1`を設定すると有効になります。
